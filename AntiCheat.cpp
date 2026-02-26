@@ -10,6 +10,8 @@
 #include <string>
 #include <algorithm>
 
+#include "SHA256.cpp"
+
 static const char* kTag = "[Javelin AntiCheat] ";
 
 // --- Configurable lists ---
@@ -102,7 +104,7 @@ static bool checkSuspiciousProcesses() {
     return false;
 }
 
-static bool checkSelfIntegrity(uint32_t expectedCrc) {
+static bool checkSelfIntegrityCrc32(uint32_t expectedCrc) {
     wchar_t path[MAX_PATH]{};
     if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
 
@@ -113,9 +115,25 @@ static bool checkSelfIntegrity(uint32_t expectedCrc) {
     return current == expectedCrc;
 }
 
-// --- Entry helper (embed a baseline CRC once you ship a build) ---
+static bool checkSelfIntegritySha256(const std::array<uint8_t, 32>& expected) {
+    wchar_t path[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
+
+    std::vector<uint8_t> bytes;
+    if (!readFile(path, bytes)) return false;
+
+    const auto current = sha256::hashBytes(bytes);
+    return current == expected;
+}
+
+// --- Entry helper ---
+// Embed a baseline checksum/hash once you ship a build.
 #ifndef JAVELIN_EXPECTED_CRC32
-#define JAVELIN_EXPECTED_CRC32 0u  // Set this at build time (e.g., /DJAVELIN_EXPECTED_CRC32=0x12345678)
+#define JAVELIN_EXPECTED_CRC32 0u  // Set at build time (e.g., /DJAVELIN_EXPECTED_CRC32=0x12345678)
+#endif
+
+#ifndef JAVELIN_EXPECTED_SHA256_HEX
+#define JAVELIN_EXPECTED_SHA256_HEX nullptr  // Set at build time (64 hex chars)
 #endif
 
 int main() {
@@ -131,10 +149,20 @@ int main() {
         return 0xBAD; // code for bad process
     }
 
-    if (JAVELIN_EXPECTED_CRC32 != 0u) {
-        if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
+    if (JAVELIN_EXPECTED_SHA256_HEX != nullptr) {
+        std::array<uint8_t, 32> expected{};
+        if (!sha256::parseHex32(JAVELIN_EXPECTED_SHA256_HEX, expected)) {
+            std::cerr << kTag << "Integrity config invalid (expected SHA-256 must be 64 hex chars). Exiting.\n";
+            return 0xBADC0DE;
+        }
+        if (!checkSelfIntegritySha256(expected)) {
+            std::cerr << kTag << "Integrity check failed (SHA-256 mismatch). Exiting.\n";
+            return 0xC0FFEE;
+        }
+    } else if (JAVELIN_EXPECTED_CRC32 != 0u) {
+        if (!checkSelfIntegrityCrc32(JAVELIN_EXPECTED_CRC32)) {
             std::cerr << kTag << "Integrity check failed (CRC mismatch). Exiting.\n";
-            return 0xCRC; // custom code (note: non-standard, may be truncated)
+            return 0xC0DE;
         }
     }
 
