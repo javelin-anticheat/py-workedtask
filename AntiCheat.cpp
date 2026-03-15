@@ -1,14 +1,17 @@
 // AntiCheat.cpp
 // Javelin Project - Minimal Anti-Cheat guards
-// Features: debugger detection, suspicious process scan, basic self-integrity (CRC32)
+// Features: debugger detection, suspicious process scan, basic self-integrity (CRC32 + SHA-256)
 
 #include <windows.h>
+#include <bcrypt.h>
 #include <tlhelp32.h>
 #include <iostream>
 #include <fstream>
 #include <vector>
 #include <string>
 #include <algorithm>
+
+#pragma comment(lib, "bcrypt.lib")
 
 static const char* kTag = "[Javelin AntiCheat] ";
 
@@ -53,6 +56,47 @@ static bool readFile(const std::wstring& path, std::vector<uint8_t>& out) {
     out.resize(static_cast<size_t>(size));
     if (!f.read(reinterpret_cast<char*>(out.data()), size)) return false;
     return true;
+}
+
+// Convert a byte array to a lowercase hex string
+static std::string bytesToHex(const uint8_t* data, size_t len) {
+    static const char hex[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(len * 2);
+    for (size_t i = 0; i < len; ++i) {
+        result.push_back(hex[data[i] >> 4]);
+        result.push_back(hex[data[i] & 0x0F]);
+    }
+    return result;
+}
+
+// Compute SHA-256 of a byte buffer using Windows BCrypt API
+static bool computeSHA256(const std::vector<uint8_t>& data, uint8_t hashOut[32]) {
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+    bool ok = false;
+
+    if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0)
+        return false;
+
+    if (BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0) != 0) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return false;
+    }
+
+    if (BCryptHashData(hHash, const_cast<PUCHAR>(data.data()),
+                       static_cast<ULONG>(data.size()), 0) != 0) {
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return false;
+    }
+
+    if (BCryptFinishHash(hHash, hashOut, 32, 0) == 0)
+        ok = true;
+
+    BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return ok;
 }
 
 // --- Checks ---
@@ -113,9 +157,28 @@ static bool checkSelfIntegrity(uint32_t expectedCrc) {
     return current == expectedCrc;
 }
 
-// --- Entry helper (embed a baseline CRC once you ship a build) ---
+// SHA-256 self-integrity check
+static bool checkSelfIntegritySHA256(const std::string& expectedHex) {
+    wchar_t path[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
+
+    std::vector<uint8_t> bytes;
+    if (!readFile(path, bytes)) return false;
+
+    uint8_t hash[32]{};
+    if (!computeSHA256(bytes, hash)) return false;
+
+    std::string currentHex = bytesToHex(hash, 32);
+    return currentHex == toLower(std::string(expectedHex));
+}
+
+// --- Build-time constants ---
 #ifndef JAVELIN_EXPECTED_CRC32
-#define JAVELIN_EXPECTED_CRC32 0u  // Set this at build time (e.g., /DJAVELIN_EXPECTED_CRC32=0x12345678)
+#define JAVELIN_EXPECTED_CRC32 0u  // Set at build time (e.g., /DJAVELIN_EXPECTED_CRC32=0x12345678)
+#endif
+
+#ifndef JAVELIN_EXPECTED_SHA256
+#define JAVELIN_EXPECTED_SHA256 ""  // Set at build time (e.g., /DJAVELIN_EXPECTED_SHA256="abcdef...")
 #endif
 
 int main() {
@@ -131,10 +194,20 @@ int main() {
         return 0xBAD; // code for bad process
     }
 
+    // CRC32 integrity check
     if (JAVELIN_EXPECTED_CRC32 != 0u) {
         if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
-            std::cerr << kTag << "Integrity check failed (CRC mismatch). Exiting.\n";
-            return 0xCRC; // custom code (note: non-standard, may be truncated)
+            std::cerr << kTag << "Integrity check failed (CRC32 mismatch). Exiting.\n";
+            return 0xCRC;
+        }
+    }
+
+    // SHA-256 integrity check
+    static const std::string expectedSHA256 = JAVELIN_EXPECTED_SHA256;
+    if (!expectedSHA256.empty()) {
+        if (!checkSelfIntegritySHA256(expectedSHA256)) {
+            std::cerr << kTag << "Integrity check failed (SHA-256 mismatch). Exiting.\n";
+            return 0x54A; // SHA-256 mismatch exit code
         }
     }
 
