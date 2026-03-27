@@ -115,7 +115,7 @@ static bool checkSelfIntegrity(uint32_t expectedCrc) {
 
 // --- Entry helper (embed a baseline CRC once you ship a build) ---
 #ifndef JAVELIN_EXPECTED_CRC32
-#define JAVELIN_EXPECTED_CRC32 0u  // Set this at build time (e.g., /DJAVELIN_EXPECTED_CRC32=0x12345678)
+#define JAVELIN_EXPECTED_CRC32 0x00000000u  // Set this at build time: /DJAVELIN_EXPECTED_CRC32=0x<YourHexHash>
 #endif
 
 int main() {
