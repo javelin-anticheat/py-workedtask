@@ -1,6 +1,18 @@
-# integrity/__init__.py
-# Exposes the public surface of the integrity verification package.
+"""
+integrity
+---------
+Public API for Javelin AntiCheat script-integrity verification.
 
-from .checker import verify_script_integrity, compute_sha256
+Quick start
+~~~~~~~~~~~
+::
 
-__all__ = ["verify_script_integrity", "compute_sha256"]
+    from integrity import verify_script_integrity
+    verify_script_integrity(__file__)   # exits via sys.exit(1) on mismatch
+
+See :mod:`integrity.verify` for full documentation.
+"""
+
+from .verify import IntegrityError, verify_script_integrity
+
+__all__ = ["IntegrityError", "verify_script_integrity"]
