@@ -4,6 +4,7 @@
 
 #include <windows.h>
 #include <tlhelp32.h>
+#include <intrin.h>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -134,7 +135,7 @@ int main() {
     if (JAVELIN_EXPECTED_CRC32 != 0u) {
         if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
             std::cerr << kTag << "Integrity check failed (CRC mismatch). Exiting.\n";
-            return 0xCRC; // custom code (note: non-standard, may be truncated)
+            return 0x1CC; // non-zero error code for failed integrity checks
         }
     }
 
