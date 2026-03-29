@@ -1,96 +1,110 @@
 # Integrity Verification
 
-Javelin Anti-Cheat uses **SHA-256** integrity verification to ensure that task
-scripts (Python) and the runtime binary (C++) have not been tampered with
-before any privileged work begins.
+Javelin AntiCheat performs integrity verification to ensure that neither the
+Python task-runner scripts nor the C++ runtime binary have been tampered with
+before work begins.
 
 ---
 
-## Python Script Integrity
+## Python script integrity
 
-### Overview
+### How it works
 
-The `integrity` package provides a single entry-point function,
-`verify_script_integrity()`, which:
-
-1. Reads the environment variable `JAVELIN_EXPECTED_SHA256`.
-2. Computes the SHA-256 digest of the running script file.
-3. Compares the two values (case-insensitive hex string comparison).
-
-On **any** mismatch or misconfiguration, `IntegrityError` is raised and
-`sys.exit(1)` is called immediately, ensuring **no task work is performed on a
+At start-up the entry-point script calls `verify_script_integrity(__file__)`.
+The helper computes the SHA-256 digest of the script file and compares it
+against the value stored in the `JAVELIN_EXPECTED_SHA256` environment variable.
+If the digests do not match the process raises `IntegrityError` and immediately
+exits via `sys.exit(1)`, ensuring that **no task work is performed on a
 tampered script file**.
 
 ### Configuration
 
-Set `JAVELIN_EXPECTED_SHA256` to the lowercase hex SHA-256 digest of the
-trusted version of your script before running it:
+| Environment variable      | Description                                                   |
+|---------------------------|---------------------------------------------------------------|
+| `JAVELIN_EXPECTED_SHA256` | Expected lowercase hex SHA-256 digest of the entry-point script. Leave unset to skip the check (opt-in). |
+
+### Generating the expected digest
 
 ```bash
-# Compute the expected digest
-export JAVELIN_EXPECTED_SHA256=$(sha256sum task_script.py | awk '{print $1}')
+# Linux / macOS
+sha256sum task_runner.py
 
-# Run the script
-python task_script.py
+# macOS alternative
+shasum -a 256 task_runner.py
+
+# Windows (PowerShell)
+Get-FileHash task_runner.py -Algorithm SHA256
 ```
 
-On macOS, use `shasum -a 256` in place of `sha256sum`.
+Copy the hex string into your deployment environment:
+
+```bash
+export JAVELIN_EXPECTED_SHA256=<hex-digest>
+```
 
 ### Usage
 
-Call `verify_script_integrity(__file__)` at the **very top** of the protected
-script, before any task logic:
+Place the check at the very top of your entry-point script, before any other
+application code:
 
 ```python
-import os
 from integrity import verify_script_integrity
 
-# Exits via sys.exit(1) on mismatch; raises IntegrityError before exiting.
-verify_script_integrity(__file__)
+# Must be called before any task logic.
+# Exits via sys.exit(1) on mismatch; returns None silently on success.
+verify_script_integrity(__file__)   # exits via sys.exit(1) on mismatch
 
-# ... rest of task work only runs if the hash matched ...
+# --- rest of your script below ---
 ```
 
-`verify_script_integrity` resolves the supplied path to an absolute path before
-hashing, so symlinks and relative paths are handled correctly.
+> **Note:** `JAVELIN_EXPECTED_SHA256` is opt-in.  When the variable is not set
+> `verify_script_integrity` returns immediately without performing any check.
+> This allows local development without the overhead of re-computing digests on
+> every change.
 
-### Failure behaviour
+### Behaviour on failure
 
-| Condition | Effect |
-|-----------|--------|
-| `JAVELIN_EXPECTED_SHA256` not set | `IntegrityError` raised → `sys.exit(1)` |
-| Script file unreadable / missing | `IntegrityError` raised → `sys.exit(1)` |
-| Hash mismatch | `IntegrityError` raised → `sys.exit(1)` |
-| Hash matches | Returns `None`, execution continues normally |
+When a mismatch is detected `verify_script_integrity` (via `_guarded_exit`):
 
-> **Testing tip:** Mock `sys.exit` (e.g., with `unittest.mock.patch`) to
-> prevent process termination in unit tests.  `IntegrityError` is raised
-> *before* `sys.exit` is called, so you can also use `pytest.raises(IntegrityError)`
-> to assert on failure paths.
+1. Raises `integrity.IntegrityError` with a message showing both the expected
+   and the actual digest.
+2. Calls `sys.exit(1)` immediately after, terminating the process.
 
-### API reference
+In unit tests you can mock `sys.exit` **and** catch `IntegrityError` to assert
+on the failure details without the process terminating:
 
 ```python
-from integrity import verify_script_integrity, IntegrityError
+from unittest.mock import patch
+import pytest
+from integrity import IntegrityError, verify_script_integrity
 
-verify_script_integrity(script_path: str) -> None
+def test_mismatch_raises_and_exits(tmp_path):
+    script = tmp_path / "runner.py"
+    script.write_text("print('hello')")
+    env = {"JAVELIN_EXPECTED_SHA256": "deadbeef" * 8}
+
+    with patch("sys.exit") as mock_exit, \
+         pytest.raises(IntegrityError):
+        import os
+        with patch.dict(os.environ, env):
+            verify_script_integrity(script)
+
+    mock_exit.assert_called_once_with(1)
 ```
 
-**Parameters**
+### Error handling for unreadable files
 
-- `script_path` — path to the script to verify; pass `__file__` from the
-  protected module.
-
-**Raises**
-
-- `IntegrityError` — on any failure (missing env var, unreadable file, hash
-  mismatch).  `sys.exit(1)` is called immediately after.
+If the script file cannot be read (e.g. wrong permissions, file deleted between
+process start and the integrity check) `verify_script_integrity` will propagate
+an `OSError`/`PermissionError` to the caller.  The check does **not** silently
+pass for unreadable files — handle this exception at the application level as
+appropriate for your deployment.
 
 ---
 
-## C++ Runtime Integrity
+## C++ runtime integrity
 
-### Overview
+### How it works
 
 The C++ integrity checks are implemented directly in the runtime (see
 `AntiCheat.cpp` in this repository) rather than in a standalone public header.
@@ -100,44 +114,35 @@ running binary against a compile-time ("baked-in") expected value.
 
 In all configurations, the integrity check logic:
 
-- Runs before any privileged anti-cheat work begins.
-- Terminates the process immediately if the computed digest does not match the
-  baked-in expected value.
-- Logs a diagnostic message to the configured logger before terminating.
+- Runs before any anti-cheat scanning begins.
+- Compares the digest of the running binary against the value embedded at
+  compile time.
+- Terminates the process immediately if the check fails, preventing tampered
+  binaries from operating.
 
-### Configuration
+### Build configuration
 
-The expected hash is embedded at compile time via a preprocessor definition.
-In your CMake configuration (or equivalent build system), set:
+The check variant is selected at compile time via preprocessor flags:
 
-```cmake
-target_compile_definitions(javelin_anticheat PRIVATE
-    JAVELIN_EXPECTED_CRC32=0xDEADBEEF   # CRC32 build
-    # or
-    JAVELIN_EXPECTED_SHA256="<64-char hex string>"  # SHA-256 build
-)
-```
+| Flag                          | Behaviour                                      |
+|-------------------------------|------------------------------------------------|
+| `JAVELIN_INTEGRITY_SHA256`    | Enable SHA-256 binary integrity check.         |
+| `JAVELIN_INTEGRITY_CRC32`     | Enable CRC32 binary integrity check (faster).  |
+| *(neither)*                   | Integrity check disabled (development builds). |
 
-Refer to `AntiCheat.cpp` for the exact preprocessor symbols consumed and the
-locations where the integrity check is invoked.
-
-### Build modes
-
-| Build mode | Hash algorithm | Symbol |
-|------------|---------------|--------|
-| `JAVELIN_USE_CRC32` defined | CRC32 | `JAVELIN_EXPECTED_CRC32` |
-| Default / `JAVELIN_USE_SHA256` | SHA-256 | `JAVELIN_EXPECTED_SHA256` |
+Refer to `AntiCheat.cpp` for implementation details and the exact symbols used
+to embed the expected digest.
 
 ---
 
-## Security notes
+## Combining Python and C++ checks
 
-- **Environment variables are not secret.** `JAVELIN_EXPECTED_SHA256` should
-  be treated as a tamper-detection mechanism, not an authentication secret.
-  Consider distributing the expected hash out-of-band (e.g., signed manifest)
-  for higher-assurance deployments.
-- The Python implementation reads the script file as **bytes** before hashing,
-  so line-ending differences between platforms will produce different digests.
-  Always hash and distribute the script in its canonical byte form.
-- For C++, the binary hash must be recomputed and the compile-time constant
-  updated with every release build.
+For maximum protection enable both layers:
+
+1. **C++ layer** — catches tampering of the compiled anti-cheat binary before
+   it even starts.
+2. **Python layer** — catches tampering of the task-runner script that drives
+   work submission.
+
+Both checks are independent and fail-fast: if either detects a mismatch the
+process exits before any task work is performed.
