@@ -1,174 +1,143 @@
 # Integrity Verification
 
-This document explains how to configure and use the optional integrity
-verification feature for both the **Python** and **C++** implementations.
+Javelin Anti-Cheat uses **SHA-256** integrity verification to ensure that task
+scripts (Python) and the runtime binary (C++) have not been tampered with
+before any privileged work begins.
 
 ---
 
-## Python — SHA-256 of Script File
+## Python Script Integrity
 
-### How it works
+### Overview
 
-At startup the module computes a SHA-256 digest of the **script file itself**
-(i.e. `__file__` resolved to an absolute path) and compares it against the
-value stored in the environment variable `JAVELIN_EXPECTED_SHA256`.
+The `integrity` package provides a single entry-point function,
+`verify_script_integrity()`, which:
 
-If the digests do not match (or the env-var is absent and strict mode is
-enabled), the process exits immediately via the guarded-exit helper so that
-**no task work is performed on a tampered binary**.
+1. Reads the environment variable `JAVELIN_EXPECTED_SHA256`.
+2. Computes the SHA-256 digest of the running script file.
+3. Compares the two values (case-insensitive hex string comparison).
 
-### Generating the expected hash
+On **any** mismatch or misconfiguration, `IntegrityError` is raised and
+`sys.exit(1)` is called immediately, ensuring **no task work is performed on a
+tampered script file**.
 
-```bash
-# Linux / macOS
-sha256sum path/to/your_script.py
+### Configuration
 
-# macOS (alternative)
-shasum -a 256 path/to/your_script.py
-
-# Windows (PowerShell)
-Get-FileHash path\to\your_script.py -Algorithm SHA256
-```
-
-Copy the hex digest (64 characters) that is printed.
-
-### Setting the environment variable
+Set `JAVELIN_EXPECTED_SHA256` to the lowercase hex SHA-256 digest of the
+trusted version of your script before running it:
 
 ```bash
-# Linux / macOS — one-shot
-export JAVELIN_EXPECTED_SHA256="<paste-digest-here>"
-python your_script.py
+# Compute the expected digest
+export JAVELIN_EXPECTED_SHA256=$(sha256sum task_script.py | awk '{print $1}')
 
-# Windows CMD
-set JAVELIN_EXPECTED_SHA256=<paste-digest-here>
-python your_script.py
-
-# Windows PowerShell
-$env:JAVELIN_EXPECTED_SHA256 = "<paste-digest-here>"
-python your_script.py
+# Run the script
+python task_script.py
 ```
 
-You can also persist it in a `.env` file (never commit this file):
+On macOS, use `shasum -a 256` in place of `sha256sum`.
 
-```
-JAVELIN_EXPECTED_SHA256=abcdef0123456789...
-```
+### Usage
 
-### Usage in code
+Call `verify_script_integrity(__file__)` at the **very top** of the protected
+script, before any task logic:
 
 ```python
-# At the very top of your script, before any other logic:
+import os
 from integrity import verify_script_integrity
 
-verify_script_integrity(__file__)   # raises IntegrityError / exits on mismatch
+# Exits via sys.exit(1) on mismatch; raises IntegrityError before exiting.
+verify_script_integrity(__file__)
+
+# ... rest of task work only runs if the hash matched ...
 ```
 
-Optional keyword arguments:
+`verify_script_integrity` resolves the supplied path to an absolute path before
+hashing, so symlinks and relative paths are handled correctly.
 
-| Argument | Type | Default | Description |
-|---|---|---|---|
-| `strict` | `bool` | `False` | When `True`, exit even if the env-var is **not set** (treats "no expected value" as a mismatch). |
-| `env_var` | `str` | `"JAVELIN_EXPECTED_SHA256"` | Override the env-var name. |
+### Failure behaviour
 
-### Exit behaviour
+| Condition | Effect |
+|-----------|--------|
+| `JAVELIN_EXPECTED_SHA256` not set | `IntegrityError` raised → `sys.exit(1)` |
+| Script file unreadable / missing | `IntegrityError` raised → `sys.exit(1)` |
+| Hash mismatch | `IntegrityError` raised → `sys.exit(1)` |
+| Hash matches | Returns `None`, execution continues normally |
 
-A non-matching hash calls `sys.exit(1)` after printing a short tamper-warning
-to `stderr`.  The same code path is used when `strict=True` and the env-var is
-absent.
+> **Testing tip:** Mock `sys.exit` (e.g., with `unittest.mock.patch`) to
+> prevent process termination in unit tests.  `IntegrityError` is raised
+> *before* `sys.exit` is called, so you can also use `pytest.raises(IntegrityError)`
+> to assert on failure paths.
+
+### API reference
+
+```python
+from integrity import verify_script_integrity, IntegrityError
+
+verify_script_integrity(script_path: str) -> None
+```
+
+**Parameters**
+
+- `script_path` — path to the script to verify; pass `__file__` from the
+  protected module.
+
+**Raises**
+
+- `IntegrityError` — on any failure (missing env var, unreadable file, hash
+  mismatch).  `sys.exit(1)` is called immediately after.
 
 ---
 
-## C++ — CRC32 / SHA-256 of Running Executable
+## C++ Runtime Integrity
 
-### How it works
+### Overview
 
-`integrity/integrity.hpp` provides two free functions:
+The C++ integrity checks are implemented directly in the runtime (see
+`AntiCheat.cpp` in this repository) rather than in a standalone public header.
+That code is invoked early during process startup and, depending on build
+configuration, performs either a CRC32 or SHA-256 integrity check of the
+running binary against a compile-time ("baked-in") expected value.
 
-| Function | Algorithm | Use when… |
-|---|---|---|
-| `javelin::verify_crc32(expected)` | CRC32 | Fast, minimal code-size overhead |
-| `javelin::verify_sha256(expected)` | SHA-256 (pure C++ / OpenSSL) | Higher collision resistance |
+In all configurations, the integrity check logic:
 
-Both functions:
-1. Resolve the path of the **currently running executable** (`/proc/self/exe`
-   on Linux, `GetModuleFileName` on Windows, `_NSGetExecutablePath` on macOS).
-2. Compute the chosen digest over the entire file.
-3. Compare it (constant-time) to the `expected` string you baked in at
-   build time.
-4. Call `std::exit(1)` on mismatch after printing a warning to `stderr`.
+- Runs before any privileged anti-cheat work begins.
+- Terminates the process immediately if the computed digest does not match the
+  baked-in expected value.
+- Logs a diagnostic message to the configured logger before terminating.
 
-### Generating the expected hash
+### Configuration
 
-```bash
-# CRC32  (requires 'crc32' utility, part of libarchive-zip-perl or zlib)
-crc32 ./your_binary          # prints an 8-char hex value
+The expected hash is embedded at compile time via a preprocessor definition.
+In your CMake configuration (or equivalent build system), set:
 
-# SHA-256
-sha256sum ./your_binary      # prints a 64-char hex value
+```cmake
+target_compile_definitions(javelin_anticheat PRIVATE
+    JAVELIN_EXPECTED_CRC32=0xDEADBEEF   # CRC32 build
+    # or
+    JAVELIN_EXPECTED_SHA256="<64-char hex string>"  # SHA-256 build
+)
 ```
 
-On Windows (PowerShell):
+Refer to `AntiCheat.cpp` for the exact preprocessor symbols consumed and the
+locations where the integrity check is invoked.
 
-```powershell
-# SHA-256
-(Get-FileHash .\your_binary.exe -Algorithm SHA256).Hash.ToLower()
-```
+### Build modes
 
-### Embedding the expected hash
-
-The expected value is a **build-time constant** defined *before* including the
-header (or via a compiler `-D` flag):
-
-```cpp
-// Option A — define before include
-#define JAVELIN_EXPECTED_CRC32  "a1b2c3d4"
-#define JAVELIN_EXPECTED_SHA256 "abcdef0123456789..."
-#include "integrity/integrity.hpp"
-
-// Option B — pass via CMake / compiler flag
-// cmake -DJAVELIN_EXPECTED_SHA256="abcdef..." .
-// In CMakeLists.txt:
-//   target_compile_definitions(my_target PRIVATE
-//       JAVELIN_EXPECTED_SHA256="${JAVELIN_EXPECTED_SHA256}")
-```
-
-### Usage in code
-
-```cpp
-#include "integrity/integrity.hpp"
-
-int main() {
-    // Check CRC32 (fast)
-    javelin::verify_crc32(JAVELIN_EXPECTED_CRC32);
-
-    // — or — check SHA-256 (stronger)
-    javelin::verify_sha256(JAVELIN_EXPECTED_SHA256);
-
-    // ... rest of your program
-}
-```
-
-### Platform notes
-
-| Platform | Executable path API |
-|---|---|
-| Linux | `/proc/self/exe` (symlink) |
-| macOS | `_NSGetExecutablePath` |
-| Windows | `GetModuleFileNameA` |
-
-The SHA-256 implementation shipped in `integrity.hpp` is a self-contained
-pure-C++ version (no external dependencies).  If you prefer OpenSSL, define
-`JAVELIN_USE_OPENSSL` before including the header.
+| Build mode | Hash algorithm | Symbol |
+|------------|---------------|--------|
+| `JAVELIN_USE_CRC32` defined | CRC32 | `JAVELIN_EXPECTED_CRC32` |
+| Default / `JAVELIN_USE_SHA256` | SHA-256 | `JAVELIN_EXPECTED_SHA256` |
 
 ---
 
 ## Security notes
 
-* The hash comparison uses a **constant-time** comparison (`std::equal` with
-  a fixed-length loop in C++; `hmac.compare_digest` in Python) to prevent
-  timing side-channels.
-* The expected hash should be treated as a **secret build artifact** — do not
-  commit it in plaintext to a public repository.
-* This feature is a *defence-in-depth* measure.  A determined attacker with
-  write access to the binary can also patch the embedded constant; combine
-  this with code-signing for stronger guarantees.
+- **Environment variables are not secret.** `JAVELIN_EXPECTED_SHA256` should
+  be treated as a tamper-detection mechanism, not an authentication secret.
+  Consider distributing the expected hash out-of-band (e.g., signed manifest)
+  for higher-assurance deployments.
+- The Python implementation reads the script file as **bytes** before hashing,
+  so line-ending differences between platforms will produce different digests.
+  Always hash and distribute the script in its canonical byte form.
+- For C++, the binary hash must be recomputed and the compile-time constant
+  updated with every release build.
