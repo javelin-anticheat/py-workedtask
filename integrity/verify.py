@@ -1,17 +1,27 @@
 """
 integrity/verify.py
 -------------------
-SHA-256-based integrity verification for Python scripts.
+SHA-256 integrity verification for Python task scripts.
 
 Usage
 -----
-Set the environment variable ``JAVELIN_EXPECTED_SHA256`` to the expected
-hex-digest of the script before launching it, then call
-``verify_script_integrity(__file__)`` at the top of your entry-point.
+Set the environment variable ``JAVELIN_EXPECTED_SHA256`` to the lowercase hex
+digest of the script you want to protect, then call
+``verify_script_integrity(__file__)`` at the very top of your script (before
+any task logic).
 
-If the digest does not match, ``_guarded_exit`` raises ``IntegrityError``
-**and** calls ``sys.exit(1)`` so the process terminates whether or not the
-caller catches the exception.
+    import os
+    os.environ["JAVELIN_EXPECTED_SHA256"] = "<hex-digest>"
+
+    from integrity import verify_script_integrity
+    verify_script_integrity(__file__)  # exits via sys.exit(1) on mismatch
+
+The function will:
+  1. Compute the SHA-256 hash of the resolved, absolute path of the script.
+  2. Compare it to ``JAVELIN_EXPECTED_SHA256``.
+  3. If they do not match, raise ``IntegrityError`` **and** call
+     ``sys.exit(1)`` so the process terminates unconditionally.
+  4. If ``JAVELIN_EXPECTED_SHA256`` is not set, a ``RuntimeError`` is raised.
 """
 
 from __future__ import annotations
@@ -26,15 +36,14 @@ from pathlib import Path
 # Public exception
 # ---------------------------------------------------------------------------
 
-class IntegrityError(RuntimeError):
-    """Raised when a script's SHA-256 digest does not match the expected value.
+class IntegrityError(Exception):
+    """Raised when the computed hash of a script does not match the expected
+    value stored in ``JAVELIN_EXPECTED_SHA256``.
 
-    This exception is raised by :func:`verify_script_integrity` (via
-    ``_guarded_exit``) before ``sys.exit(1)`` is called.  In normal
-    production use the process will exit immediately after the raise; in
-    unit-test scenarios you can mock ``sys.exit`` **and** catch
-    ``IntegrityError`` to inspect failure details without the process
-    actually terminating.
+    In normal (non-test) execution this exception is raised **and** the
+    process is terminated immediately via ``sys.exit(1)``.  In unit-test
+    scenarios where ``sys.exit`` is mocked/patched, the exception will
+    propagate so that test code can assert on it.
     """
 
 
@@ -42,57 +51,41 @@ class IntegrityError(RuntimeError):
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+ENV_VAR = "JAVELIN_EXPECTED_SHA256"
+_CHUNK_SIZE = 65_536  # 64 KiB
+
+
 def _compute_sha256(path: Path) -> str:
     """Return the lowercase hex SHA-256 digest of *path*.
-
-    Parameters
-    ----------
-    path:
-        Resolved, absolute path to the file to hash.
-
-    Returns
-    -------
-    str
-        Lowercase hexadecimal SHA-256 digest.
 
     Raises
     ------
     OSError
         If the file cannot be opened or read (e.g. permission denied,
-        file removed between resolution and open, transient I/O error).
+        file removed between path resolution and read, transient I/O error).
     """
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(_CHUNK_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def _guarded_exit(script_path: Path, actual: str, expected: str) -> None:
-    """Raise :exc:`IntegrityError` and call ``sys.exit(1)``.
+def _guarded_exit(message: str) -> None:
+    """Raise ``IntegrityError`` with *message* and exit the process.
 
-    The exception is raised *first* so that unit tests that mock
-    ``sys.exit`` can still catch and inspect the failure.  In production
-    the ``sys.exit(1)`` call that follows will terminate the process
-    regardless.
-
-    Parameters
-    ----------
-    script_path:
-        Path of the script whose digest did not match.
-    actual:
-        The digest that was computed.
-    expected:
-        The digest that was expected.
+    ``IntegrityError`` is raised *before* ``sys.exit`` so that unit tests that
+    patch ``sys.exit`` can still observe and assert on the exception.
     """
-    message = (
-        f"Integrity check failed for '{script_path}'.\n"
-        f"  expected : {expected}\n"
-        f"  actual   : {actual}"
-    )
+    exc = IntegrityError(message)
     try:
-        raise IntegrityError(message)
+        raise exc
     finally:
+        # Ensure the process terminates even if the caller catches the
+        # exception (e.g. a bare ``except:`` clause in task code).
         sys.exit(1)
 
 
@@ -100,52 +93,57 @@ def _guarded_exit(script_path: Path, actual: str, expected: str) -> None:
 # Public API
 # ---------------------------------------------------------------------------
 
-def verify_script_integrity(script_file: str | os.PathLike[str]) -> None:
-    """Verify the SHA-256 integrity of *script_file*.
-
-    Reads the ``JAVELIN_EXPECTED_SHA256`` environment variable for the
-    expected digest.  If the variable is not set the check is skipped
-    silently (opt-in behaviour).  If it *is* set and the computed digest
-    does not match, :func:`_guarded_exit` raises :exc:`IntegrityError`
-    **and** calls ``sys.exit(1)``.
+def verify_script_integrity(script_path: str | os.PathLike[str]) -> None:
+    """Verify the SHA-256 hash of *script_path* against ``JAVELIN_EXPECTED_SHA256``.
 
     Parameters
     ----------
-    script_file:
-        Path to the script to verify — typically pass ``__file__`` from
-        your entry-point module.
+    script_path:
+        Path to the script file to verify.  Pass ``__file__`` to check the
+        currently running script.
 
     Raises
     ------
+    RuntimeError
+        If ``JAVELIN_EXPECTED_SHA256`` is not set in the environment.
     IntegrityError
-        When ``JAVELIN_EXPECTED_SHA256`` is set and the file's digest does
-        not match.  ``sys.exit(1)`` is also called immediately after the
-        raise, so the process exits via ``sys.exit(1)`` on mismatch in
-        normal (non-mocked) execution.
+        If the computed SHA-256 digest does not match ``JAVELIN_EXPECTED_SHA256``.
+        The process is also terminated via ``sys.exit(1)``.
     OSError
-        If the file cannot be read (e.g. permission denied, missing file).
-        The caller is responsible for deciding how to handle unreadable
-        files; the integrity check does **not** silently pass in that case.
+        If the script file cannot be read (permission denied, missing file,
+        or other I/O error).
 
-    Examples
-    --------
-    Place this at the very top of your entry-point script::
-
-        from integrity import verify_script_integrity
-        verify_script_integrity(__file__)   # exits via sys.exit(1) on mismatch
-
-    The function returns ``None`` silently when the check passes or when
-    ``JAVELIN_EXPECTED_SHA256`` is not set.
+    Notes
+    -----
+    On a hash mismatch the function raises ``IntegrityError`` **and** calls
+    ``sys.exit(1)``.  In unit tests where ``sys.exit`` is patched/mocked the
+    ``IntegrityError`` will propagate normally so tests can assert on it
+    without the process actually exiting.
     """
-    expected = os.environ.get("JAVELIN_EXPECTED_SHA256")
-    if not expected:
-        # Opt-in: skip check when variable is absent.
-        return
+    expected = os.environ.get(ENV_VAR)
+    if expected is None:
+        raise RuntimeError(
+            f"Environment variable '{ENV_VAR}' is not set. "
+            "Set it to the expected SHA-256 hex digest of the script before "
+            "calling verify_script_integrity()."
+        )
 
-    resolved = Path(script_file).resolve()
-    # Let OSError/PermissionError propagate to the caller rather than
-    # swallowing it; a file we cannot read should not silently pass.
-    actual = _compute_sha256(resolved)
+    expected = expected.strip().lower()
 
-    if actual.lower() != expected.lower():
-        _guarded_exit(resolved, actual, expected.lower())
+    resolved = Path(script_path).resolve()
+
+    try:
+        actual = _compute_sha256(resolved)
+    except OSError as exc:
+        raise OSError(
+            f"Could not read script file for integrity check: {resolved!r}. "
+            f"Reason: {exc}"
+        ) from exc
+
+    if actual != expected:
+        _guarded_exit(
+            f"Integrity check FAILED for {resolved!r}.\n"
+            f"  Expected : {expected}\n"
+            f"  Computed : {actual}\n"
+            "The script may have been tampered with."
+        )
