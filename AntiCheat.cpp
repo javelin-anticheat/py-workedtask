@@ -4,6 +4,7 @@
 
 #include <windows.h>
 #include <tlhelp32.h>
+#include <intrin.h>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -11,6 +12,9 @@
 #include <algorithm>
 
 static const char* kTag = "[Javelin AntiCheat] ";
+static const int kExitDebuggerDetected = 0xDEB;
+static const int kExitSuspiciousProcess = 0xBAD;
+static const int kExitIntegrityFailure = 0xC3C;
 
 // --- Configurable lists ---
 static std::vector<std::string> kSuspiciousProcesses = {
@@ -123,18 +127,18 @@ int main() {
 
     if (checkDebugger()) {
         std::cerr << kTag << "Debugger detected. Exiting.\n";
-        return 0xDEB; // code for debugger
+        return kExitDebuggerDetected;
     }
 
     if (checkSuspiciousProcesses()) {
         std::cerr << kTag << "Suspicious process detected. Exiting.\n";
-        return 0xBAD; // code for bad process
+        return kExitSuspiciousProcess;
     }
 
     if (JAVELIN_EXPECTED_CRC32 != 0u) {
         if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
             std::cerr << kTag << "Integrity check failed (CRC mismatch). Exiting.\n";
-            return 0xCRC; // custom code (note: non-standard, may be truncated)
+            return kExitIntegrityFailure;
         }
     }
 
