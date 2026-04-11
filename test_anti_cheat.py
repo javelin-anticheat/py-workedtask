@@ -1,4 +1,7 @@
 import importlib
+import hashlib
+import os
+import tempfile
 import unittest
 
 
@@ -42,6 +45,46 @@ class AntiCheatTests(unittest.TestCase):
         anti_cheat = importlib.import_module("anti_cheat")
         self.assertTrue(anti_cheat.has_suspicious_process(["CheatEngine.exe"]))
         self.assertFalse(anti_cheat.has_suspicious_process(["explorer.exe"]))
+
+    def test_sha256_helper_matches_python_hashlib(self):
+        anti_cheat = importlib.import_module("anti_cheat")
+        with tempfile.NamedTemporaryFile("wb", delete=False) as handle:
+            handle.write(b"javelin")
+            path = handle.name
+        self.addCleanup(lambda: os.remove(path) if os.path.exists(path) else None)
+
+        self.assertEqual(
+            anti_cheat.compute_sha256(path),
+            hashlib.sha256(b"javelin").hexdigest(),
+        )
+
+    def test_integrity_check_passes_with_matching_hash(self):
+        anti_cheat = importlib.import_module("anti_cheat")
+        with tempfile.NamedTemporaryFile("wb", delete=False) as handle:
+            handle.write(b"trusted")
+            path = handle.name
+        self.addCleanup(lambda: os.remove(path) if os.path.exists(path) else None)
+
+        expected = hashlib.sha256(b"trusted").hexdigest()
+        self.assertTrue(anti_cheat.verify_integrity(path, expected))
+
+    def test_integrity_check_fails_with_mismatch(self):
+        anti_cheat = importlib.import_module("anti_cheat")
+        with tempfile.NamedTemporaryFile("wb", delete=False) as handle:
+            handle.write(b"trusted")
+            path = handle.name
+        self.addCleanup(lambda: os.remove(path) if os.path.exists(path) else None)
+
+        self.assertFalse(anti_cheat.verify_integrity(path, "0" * 64))
+
+    def test_run_checks_exits_on_integrity_failure(self):
+        anti_cheat = importlib.import_module("anti_cheat")
+        code = anti_cheat.run_checks(
+            debugger_check=lambda: False,
+            process_check=lambda: False,
+            integrity_check=lambda: False,
+        )
+        self.assertEqual(code, anti_cheat.EXIT_INTEGRITY_FAILURE)
 
 
 if __name__ == "__main__":
