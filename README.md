@@ -4,6 +4,8 @@ Baseline anti-cheat guards for the Javelin project.
 
 ![Anti-cheat demo](docs/anti-cheat-demo.gif)
 
+Demo video: [docs/anti-cheat-demo.mp4](docs/anti-cheat-demo.mp4)
+
 ## Coverage
 
 - C++ client (`AntiCheat.cpp`)
