@@ -56,17 +56,25 @@ def is_debugger_attached() -> bool:
         return False
 
 
+def parse_tasklist_csv(output: str) -> list[str]:
+    reader = csv.reader(output.splitlines())
+    return [normalize_process_name(row[0]) for row in reader if row and row[0].strip()]
+
+
 def iter_windows_process_names() -> list[str]:
     if platform.system() != "Windows":
         return []
 
-    output = subprocess.check_output(
-        ["tasklist", "/FO", "CSV", "/NH"],
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
-    reader = csv.reader(output.splitlines())
-    return [normalize_process_name(row[0]) for row in reader if row]
+    try:
+        output = subprocess.check_output(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+
+    return parse_tasklist_csv(output)
 
 
 def has_suspicious_process(
