@@ -1,42 +1,63 @@
 // AntiCheat.cpp
-// Javelin Project - Minimal Anti-Cheat guards
-// Features: debugger detection, suspicious process scan, basic self-integrity (CRC32)
+// Javelin Project - baseline anti-cheat guards.
+//
+// The Windows build exits when a debugger is attached or when a known
+// cheat/debugging tool is running. Non-Windows builds compile to a no-op
+// helper so the repository can still be checked on Linux/macOS CI.
 
-#include <windows.h>
-#include <tlhelp32.h>
 #include <iostream>
-#include <fstream>
-#include <vector>
-#include <string>
-#include <algorithm>
 
 static const char* kTag = "[Javelin AntiCheat] ";
+static constexpr int kExitOk = 0;
 
-// --- Configurable lists ---
-static std::vector<std::string> kSuspiciousProcesses = {
-    "cheatengine.exe",
-    "ollydbg.exe",
-    "x64dbg.exe",
-    "httpdebuggerui.exe",
-    "ida.exe",
-    "ida64.exe",
-    "scylla.exe",
-    "processhacker.exe"
-};
+#ifndef _WIN32
 
-// --- Utils ---
-static std::string toLower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-    return s;
+int main() {
+    std::cout << kTag << "Windows-only checks skipped on this platform.\n";
+    return kExitOk;
 }
 
-// Simple CRC32 (polynomial 0xEDB88320)
+#else
+
+#include <algorithm>
+#include <cstdint>
+#include <cwctype>
+#include <fstream>
+#include <string>
+#include <tlhelp32.h>
+#include <vector>
+#include <windows.h>
+
+static constexpr int kExitDebugger = 0x0D;
+static constexpr int kExitSuspiciousProcess = 0x0B;
+static constexpr int kExitIntegrity = 0x0C;
+
+static const std::vector<std::wstring> kSuspiciousProcesses = {
+    L"cheatengine.exe",
+    L"cheatengine-x86_64.exe",
+    L"ollydbg.exe",
+    L"x64dbg.exe",
+    L"x32dbg.exe",
+    L"httpdebuggerui.exe",
+    L"ida.exe",
+    L"ida64.exe",
+    L"scylla.exe",
+    L"processhacker.exe"
+};
+
+static std::wstring toLower(std::wstring value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
+        return static_cast<wchar_t>(std::towlower(ch));
+    });
+    return value;
+}
+
 static uint32_t crc32(const std::vector<uint8_t>& data) {
     uint32_t crc = 0xFFFFFFFFu;
-    for (uint8_t b : data) {
-        crc ^= b;
-        for (int i = 0; i < 8; ++i) {
-            uint32_t mask = -(crc & 1u);
+    for (uint8_t byte : data) {
+        crc ^= byte;
+        for (int bit = 0; bit < 8; ++bit) {
+            const uint32_t mask = -(crc & 1u);
             crc = (crc >> 1) ^ (0xEDB88320u & mask);
         }
     }
@@ -44,78 +65,78 @@ static uint32_t crc32(const std::vector<uint8_t>& data) {
 }
 
 static bool readFile(const std::wstring& path, std::vector<uint8_t>& out) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-    f.seekg(0, std::ios::end);
-    std::streamsize size = f.tellg();
-    if (size <= 0) return false;
-    f.seekg(0, std::ios::beg);
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+
+    file.seekg(0, std::ios::end);
+    const std::streamsize size = file.tellg();
+    if (size <= 0) {
+        return false;
+    }
+
+    file.seekg(0, std::ios::beg);
     out.resize(static_cast<size_t>(size));
-    if (!f.read(reinterpret_cast<char*>(out.data()), size)) return false;
-    return true;
+    return static_cast<bool>(file.read(reinterpret_cast<char*>(out.data()), size));
 }
 
-// --- Checks ---
 static bool checkDebugger() {
-    if (IsDebuggerPresent()) return true;
+    if (IsDebuggerPresent()) {
+        return true;
+    }
 
-    // Secondary anti-debug: CheckBeingDebugged flag in PEB (best-effort)
-#ifdef _M_IX86
-    // 32-bit: fs:[30h] -> PEB, offset 2 = BeingDebugged (BYTE)
-    __try {
-        BYTE* peb = *(BYTE**)_readfsdword(0x30);
-        if (peb && peb[2]) return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-#elif defined(_M_X64)
-    // 64-bit: gs:[60h] -> PEB
-    __try {
-        BYTE* peb = *(BYTE**)_readgsqword(0x60);
-        if (peb && peb[2]) return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-#endif
+    BOOL remoteDebuggerPresent = FALSE;
+    if (CheckRemoteDebuggerPresent(GetCurrentProcess(), &remoteDebuggerPresent)) {
+        return remoteDebuggerPresent == TRUE;
+    }
 
     return false;
 }
 
 static bool checkSuspiciousProcesses() {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return false;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return false;
+    }
 
-    PROCESSENTRY32 pe{};
-    pe.dwSize = sizeof(pe);
-    if (!Process32First(snap, &pe)) {
-        CloseHandle(snap);
+    PROCESSENTRY32W process{};
+    process.dwSize = sizeof(process);
+    if (!Process32FirstW(snapshot, &process)) {
+        CloseHandle(snapshot);
         return false;
     }
 
     do {
-        std::string name = toLower(pe.szExeFile);
-        for (const auto& bad : kSuspiciousProcesses) {
-            if (name == toLower(bad)) {
-                CloseHandle(snap);
+        const std::wstring processName = toLower(process.szExeFile);
+        for (const std::wstring& suspiciousName : kSuspiciousProcesses) {
+            if (processName == suspiciousName) {
+                CloseHandle(snapshot);
                 return true;
             }
         }
-    } while (Process32Next(snap, &pe));
+    } while (Process32NextW(snapshot, &process));
 
-    CloseHandle(snap);
+    CloseHandle(snapshot);
     return false;
 }
 
 static bool checkSelfIntegrity(uint32_t expectedCrc) {
     wchar_t path[MAX_PATH]{};
-    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
+    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) {
+        return false;
+    }
 
     std::vector<uint8_t> bytes;
-    if (!readFile(path, bytes)) return false;
+    if (!readFile(path, bytes)) {
+        return false;
+    }
 
-    uint32_t current = crc32(bytes);
-    return current == expectedCrc;
+    return crc32(bytes) == expectedCrc;
 }
 
-// --- Entry helper (embed a baseline CRC once you ship a build) ---
 #ifndef JAVELIN_EXPECTED_CRC32
-#define JAVELIN_EXPECTED_CRC32 0u  // Set this at build time (e.g., /DJAVELIN_EXPECTED_CRC32=0x12345678)
+#define JAVELIN_EXPECTED_CRC32 0u
 #endif
 
 int main() {
@@ -123,21 +144,21 @@ int main() {
 
     if (checkDebugger()) {
         std::cerr << kTag << "Debugger detected. Exiting.\n";
-        return 0xDEB; // code for debugger
+        return kExitDebugger;
     }
 
     if (checkSuspiciousProcesses()) {
         std::cerr << kTag << "Suspicious process detected. Exiting.\n";
-        return 0xBAD; // code for bad process
+        return kExitSuspiciousProcess;
     }
 
-    if (JAVELIN_EXPECTED_CRC32 != 0u) {
-        if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
-            std::cerr << kTag << "Integrity check failed (CRC mismatch). Exiting.\n";
-            return 0xCRC; // custom code (note: non-standard, may be truncated)
-        }
+    if (JAVELIN_EXPECTED_CRC32 != 0u && !checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
+        std::cerr << kTag << "Integrity check failed. Exiting.\n";
+        return kExitIntegrity;
     }
 
     std::cout << kTag << "All clear. Continue.\n";
-    return 0;
+    return kExitOk;
 }
+
+#endif
