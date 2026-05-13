@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import csv
 import ctypes
+import hashlib
+import os
 import platform
 import subprocess
 import sys
@@ -15,6 +17,8 @@ from typing import Iterable, Sequence
 EXIT_OK = 0
 EXIT_DEBUGGER = 0x0D
 EXIT_SUSPICIOUS_PROCESS = 0x0B
+EXIT_INTEGRITY = 0x0C
+EXPECTED_SHA256_ENV = "JAVELIN_EXPECTED_SHA256"
 
 DEFAULT_SUSPICIOUS_PROCESSES = frozenset(
     {
@@ -77,6 +81,35 @@ def iter_windows_process_names() -> list[str]:
     return parse_tasklist_csv(output)
 
 
+def sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def check_script_integrity(
+    script_path: str = __file__,
+    expected_sha256: str | None = None,
+) -> bool:
+    expected = expected_sha256
+    if expected is None:
+        expected = os.environ.get(EXPECTED_SHA256_ENV)
+
+    if not expected:
+        return True
+
+    expected = expected.strip().lower()
+    if len(expected) != 64 or any(ch not in "0123456789abcdef" for ch in expected):
+        return False
+
+    try:
+        return sha256_file(script_path).lower() == expected
+    except OSError:
+        return False
+
+
 def has_suspicious_process(
     process_names: Iterable[str] | None = None,
     suspicious_names: Sequence[str] = tuple(DEFAULT_SUSPICIOUS_PROCESSES),
@@ -90,12 +123,19 @@ def has_suspicious_process(
     return any(name in suspicious for name in processes)
 
 
-def run_checks(process_names: Iterable[str] | None = None) -> CheckResult:
+def run_checks(
+    process_names: Iterable[str] | None = None,
+    script_path: str = __file__,
+    expected_sha256: str | None = None,
+) -> CheckResult:
     if is_debugger_attached():
         return CheckResult(False, EXIT_DEBUGGER, "debugger detected")
 
     if has_suspicious_process(process_names):
         return CheckResult(False, EXIT_SUSPICIOUS_PROCESS, "suspicious process detected")
+
+    if not check_script_integrity(script_path, expected_sha256):
+        return CheckResult(False, EXIT_INTEGRITY, "script integrity check failed")
 
     return CheckResult(True, EXIT_OK, "all clear")
 

@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from unittest import mock
 
@@ -50,6 +51,42 @@ class AntiCheatTests(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertEqual(result.exit_code, anti_cheat.EXIT_SUSPICIOUS_PROCESS)
+
+    def test_script_integrity_allows_missing_expected_hash(self):
+        with tempfile.NamedTemporaryFile() as script:
+            script.write(b"print('ok')\n")
+            script.flush()
+
+            self.assertTrue(anti_cheat.check_script_integrity(script.name, expected_sha256=""))
+
+    def test_script_integrity_allows_matching_hash(self):
+        with tempfile.NamedTemporaryFile() as script:
+            script.write(b"print('ok')\n")
+            script.flush()
+            expected = anti_cheat.sha256_file(script.name)
+
+            self.assertTrue(anti_cheat.check_script_integrity(script.name, expected))
+
+    def test_script_integrity_rejects_mismatch(self):
+        with tempfile.NamedTemporaryFile() as script:
+            script.write(b"print('tampered')\n")
+            script.flush()
+
+            self.assertFalse(anti_cheat.check_script_integrity(script.name, "0" * 64))
+
+    @mock.patch("anti_cheat.is_debugger_attached", return_value=False)
+    def test_run_checks_exits_for_integrity_mismatch(self, _debugger):
+        with tempfile.NamedTemporaryFile() as script:
+            script.write(b"print('tampered')\n")
+            script.flush()
+            result = anti_cheat.run_checks(
+                ["python.exe"],
+                script_path=script.name,
+                expected_sha256="0" * 64,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.exit_code, anti_cheat.EXIT_INTEGRITY)
 
     @mock.patch("anti_cheat.is_debugger_attached", return_value=False)
     def test_run_checks_allows_clean_runtime(self, _debugger):
