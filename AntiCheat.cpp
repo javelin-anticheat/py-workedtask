@@ -2,15 +2,25 @@
 // Javelin Project - Minimal Anti-Cheat guards
 // Features: debugger detection, suspicious process scan, basic self-integrity (CRC32)
 
+#ifdef _WIN32
 #include <windows.h>
 #include <tlhelp32.h>
+#endif
+
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
+#include <filesystem>
 #include <iostream>
 #include <fstream>
-#include <vector>
 #include <string>
-#include <algorithm>
+#include <vector>
 
 static const char* kTag = "[Javelin AntiCheat] ";
+
+static constexpr int kExitDebugger = 0x0DEB;
+static constexpr int kExitSuspiciousProcess = 0x0BAD;
+static constexpr int kExitIntegrityFailure = 0x0C0C;
 
 // --- Configurable lists ---
 static std::vector<std::string> kSuspiciousProcesses = {
@@ -26,7 +36,9 @@ static std::vector<std::string> kSuspiciousProcesses = {
 
 // --- Utils ---
 static std::string toLower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
     return s;
 }
 
@@ -44,7 +56,11 @@ static uint32_t crc32(const std::vector<uint8_t>& data) {
 }
 
 static bool readFile(const std::wstring& path, std::vector<uint8_t>& out) {
-    std::ifstream f(path, std::ios::binary);
+#ifdef _WIN32
+    std::ifstream f(std::filesystem::path(path), std::ios::binary);
+#else
+    std::ifstream f(std::string(path.begin(), path.end()), std::ios::binary);
+#endif
     if (!f) return false;
     f.seekg(0, std::ios::end);
     std::streamsize size = f.tellg();
@@ -57,27 +73,22 @@ static bool readFile(const std::wstring& path, std::vector<uint8_t>& out) {
 
 // --- Checks ---
 static bool checkDebugger() {
+#ifdef _WIN32
     if (IsDebuggerPresent()) return true;
 
-    // Secondary anti-debug: CheckBeingDebugged flag in PEB (best-effort)
-#ifdef _M_IX86
-    // 32-bit: fs:[30h] -> PEB, offset 2 = BeingDebugged (BYTE)
-    __try {
-        BYTE* peb = *(BYTE**)_readfsdword(0x30);
-        if (peb && peb[2]) return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-#elif defined(_M_X64)
-    // 64-bit: gs:[60h] -> PEB
-    __try {
-        BYTE* peb = *(BYTE**)_readgsqword(0x60);
-        if (peb && peb[2]) return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-#endif
+    BOOL remoteDebugger = FALSE;
+    if (CheckRemoteDebuggerPresent(GetCurrentProcess(), &remoteDebugger) && remoteDebugger) {
+        return true;
+    }
 
     return false;
+#else
+    return false;
+#endif
 }
 
 static bool checkSuspiciousProcesses() {
+#ifdef _WIN32
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return false;
 
@@ -100,9 +111,13 @@ static bool checkSuspiciousProcesses() {
 
     CloseHandle(snap);
     return false;
+#else
+    return false;
+#endif
 }
 
 static bool checkSelfIntegrity(uint32_t expectedCrc) {
+#ifdef _WIN32
     wchar_t path[MAX_PATH]{};
     if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
 
@@ -111,6 +126,10 @@ static bool checkSelfIntegrity(uint32_t expectedCrc) {
 
     uint32_t current = crc32(bytes);
     return current == expectedCrc;
+#else
+    (void)expectedCrc;
+    return false;
+#endif
 }
 
 // --- Entry helper (embed a baseline CRC once you ship a build) ---
@@ -123,18 +142,18 @@ int main() {
 
     if (checkDebugger()) {
         std::cerr << kTag << "Debugger detected. Exiting.\n";
-        return 0xDEB; // code for debugger
+        return kExitDebugger;
     }
 
     if (checkSuspiciousProcesses()) {
         std::cerr << kTag << "Suspicious process detected. Exiting.\n";
-        return 0xBAD; // code for bad process
+        return kExitSuspiciousProcess;
     }
 
     if (JAVELIN_EXPECTED_CRC32 != 0u) {
         if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
             std::cerr << kTag << "Integrity check failed (CRC mismatch). Exiting.\n";
-            return 0xCRC; // custom code (note: non-standard, may be truncated)
+            return kExitIntegrityFailure;
         }
     }
 
