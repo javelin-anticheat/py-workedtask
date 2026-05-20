@@ -4,6 +4,8 @@
 
 #include <windows.h>
 #include <tlhelp32.h>
+#include <cstdint>
+#include <cctype>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -11,6 +13,9 @@
 #include <algorithm>
 
 static const char* kTag = "[Javelin AntiCheat] ";
+static constexpr int kExitDebuggerDetected = 0xDEB;
+static constexpr int kExitSuspiciousProcess = 0xBAD;
+static constexpr int kExitIntegrityFailure = 0xC7C;
 
 // --- Configurable lists ---
 static std::vector<std::string> kSuspiciousProcesses = {
@@ -26,7 +31,9 @@ static std::vector<std::string> kSuspiciousProcesses = {
 
 // --- Utils ---
 static std::string toLower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
     return s;
 }
 
@@ -81,9 +88,9 @@ static bool checkSuspiciousProcesses() {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return false;
 
-    PROCESSENTRY32 pe{};
+    PROCESSENTRY32A pe{};
     pe.dwSize = sizeof(pe);
-    if (!Process32First(snap, &pe)) {
+    if (!Process32FirstA(snap, &pe)) {
         CloseHandle(snap);
         return false;
     }
@@ -96,7 +103,7 @@ static bool checkSuspiciousProcesses() {
                 return true;
             }
         }
-    } while (Process32Next(snap, &pe));
+    } while (Process32NextA(snap, &pe));
 
     CloseHandle(snap);
     return false;
@@ -123,18 +130,18 @@ int main() {
 
     if (checkDebugger()) {
         std::cerr << kTag << "Debugger detected. Exiting.\n";
-        return 0xDEB; // code for debugger
+        return kExitDebuggerDetected;
     }
 
     if (checkSuspiciousProcesses()) {
         std::cerr << kTag << "Suspicious process detected. Exiting.\n";
-        return 0xBAD; // code for bad process
+        return kExitSuspiciousProcess;
     }
 
     if (JAVELIN_EXPECTED_CRC32 != 0u) {
         if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
             std::cerr << kTag << "Integrity check failed (CRC mismatch). Exiting.\n";
-            return 0xCRC; // custom code (note: non-standard, may be truncated)
+            return kExitIntegrityFailure;
         }
     }
 
