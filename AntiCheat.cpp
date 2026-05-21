@@ -1,9 +1,11 @@
 // AntiCheat.cpp
 // Javelin Project - Minimal Anti-Cheat guards
-// Features: debugger detection, suspicious process scan, basic self-integrity (CRC32)
+// Features: debugger detection, suspicious process scan, optional self-integrity (CRC32)
 
 #include <windows.h>
 #include <tlhelp32.h>
+#include <cstdint>
+#include <iomanip>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -11,6 +13,15 @@
 #include <algorithm>
 
 static const char* kTag = "[Javelin AntiCheat] ";
+
+// --- Entry helper (embed a baseline CRC once you ship a build) ---
+#ifndef JAVELIN_EXPECTED_CRC32
+#define JAVELIN_EXPECTED_CRC32 0u  // Set at build time, e.g. /DJAVELIN_EXPECTED_CRC32=0x12345678
+#endif
+
+static constexpr int kExitDebugger = 0x0DEB;
+static constexpr int kExitSuspiciousProcess = 0x0BAD;
+static constexpr int kExitIntegrity = 0x0C0D;
 
 // --- Configurable lists ---
 static std::vector<std::string> kSuspiciousProcesses = {
@@ -43,6 +54,45 @@ static uint32_t crc32(const std::vector<uint8_t>& data) {
     return ~crc;
 }
 
+static std::vector<uint8_t> expectedCrcMarkerBytes(uint32_t expectedCrc) {
+    return {
+        'J', 'V', 'L', 'N', '_', 'C', 'R', 'C', '3', '2', '_',
+        static_cast<uint8_t>((expectedCrc >> 0) & 0xFFu),
+        static_cast<uint8_t>((expectedCrc >> 8) & 0xFFu),
+        static_cast<uint8_t>((expectedCrc >> 16) & 0xFFu),
+        static_cast<uint8_t>((expectedCrc >> 24) & 0xFFu),
+        '_', 'E', 'N', 'D'
+    };
+}
+
+static const uint8_t kExpectedCrcMarker[] = {
+    'J', 'V', 'L', 'N', '_', 'C', 'R', 'C', '3', '2', '_',
+    static_cast<uint8_t>((JAVELIN_EXPECTED_CRC32 >> 0) & 0xFFu),
+    static_cast<uint8_t>((JAVELIN_EXPECTED_CRC32 >> 8) & 0xFFu),
+    static_cast<uint8_t>((JAVELIN_EXPECTED_CRC32 >> 16) & 0xFFu),
+    static_cast<uint8_t>((JAVELIN_EXPECTED_CRC32 >> 24) & 0xFFu),
+    '_', 'E', 'N', 'D'
+};
+
+static bool findMarkerOffset(const std::vector<uint8_t>& bytes, const std::vector<uint8_t>& marker, size_t& offset) {
+    auto it = std::search(bytes.begin(), bytes.end(), marker.begin(), marker.end());
+    if (it == bytes.end()) return false;
+    offset = static_cast<size_t>(std::distance(bytes.begin(), it));
+    return true;
+}
+
+static bool normalizeEmbeddedExpectedCrc(std::vector<uint8_t>& bytes, uint32_t expectedCrc) {
+    const std::vector<uint8_t> marker = expectedCrcMarkerBytes(expectedCrc);
+    size_t markerOffset = 0;
+    if (!findMarkerOffset(bytes, marker, markerOffset)) return false;
+
+    const size_t crcOffset = markerOffset + 11;
+    for (size_t i = 0; i < 4; ++i) {
+        bytes[crcOffset + i] = 0;
+    }
+    return true;
+}
+
 static bool readFile(const std::wstring& path, std::vector<uint8_t>& out) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
@@ -52,6 +102,24 @@ static bool readFile(const std::wstring& path, std::vector<uint8_t>& out) {
     f.seekg(0, std::ios::beg);
     out.resize(static_cast<size_t>(size));
     if (!f.read(reinterpret_cast<char*>(out.data()), size)) return false;
+    return true;
+}
+
+static bool readSelfExecutable(std::vector<uint8_t>& bytes) {
+    wchar_t path[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
+    return readFile(path, bytes);
+}
+
+static bool computeNormalizedSelfCrc(uint32_t& outCrc) {
+    std::vector<uint8_t> bytes;
+    if (!readSelfExecutable(bytes)) return false;
+
+    if (!normalizeEmbeddedExpectedCrc(bytes, JAVELIN_EXPECTED_CRC32)) {
+        return false;
+    }
+
+    outCrc = crc32(bytes);
     return true;
 }
 
@@ -103,38 +171,41 @@ static bool checkSuspiciousProcesses() {
 }
 
 static bool checkSelfIntegrity(uint32_t expectedCrc) {
-    wchar_t path[MAX_PATH]{};
-    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
-
-    std::vector<uint8_t> bytes;
-    if (!readFile(path, bytes)) return false;
-
-    uint32_t current = crc32(bytes);
+    uint32_t current = 0;
+    if (!computeNormalizedSelfCrc(current)) return false;
     return current == expectedCrc;
 }
 
-// --- Entry helper (embed a baseline CRC once you ship a build) ---
-#ifndef JAVELIN_EXPECTED_CRC32
-#define JAVELIN_EXPECTED_CRC32 0u  // Set this at build time (e.g., /DJAVELIN_EXPECTED_CRC32=0x12345678)
-#endif
+int main(int argc, char* argv[]) {
+    (void)kExpectedCrcMarker;
 
-int main() {
+    if (argc > 1 && std::string(argv[1]) == "--print-integrity-crc32") {
+        uint32_t crc = 0;
+        if (!computeNormalizedSelfCrc(crc)) {
+            std::cerr << kTag << "Unable to compute self CRC32.\n";
+            return kExitIntegrity;
+        }
+        std::cout << "0x" << std::hex << std::uppercase << std::setw(8)
+                  << std::setfill('0') << crc << "\n";
+        return 0;
+    }
+
     std::cout << kTag << "starting checks...\n";
 
     if (checkDebugger()) {
         std::cerr << kTag << "Debugger detected. Exiting.\n";
-        return 0xDEB; // code for debugger
+        return kExitDebugger;
     }
 
     if (checkSuspiciousProcesses()) {
         std::cerr << kTag << "Suspicious process detected. Exiting.\n";
-        return 0xBAD; // code for bad process
+        return kExitSuspiciousProcess;
     }
 
     if (JAVELIN_EXPECTED_CRC32 != 0u) {
         if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
             std::cerr << kTag << "Integrity check failed (CRC mismatch). Exiting.\n";
-            return 0xCRC; // custom code (note: non-standard, may be truncated)
+            return kExitIntegrity;
         }
     }
 
