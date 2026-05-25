@@ -9,6 +9,10 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <cstdint>
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 static const char* kTag = "[Javelin AntiCheat] ";
 
@@ -115,26 +119,30 @@ static bool checkSelfIntegrity(uint32_t expectedCrc) {
 
 // --- Entry helper (embed a baseline CRC once you ship a build) ---
 #ifndef JAVELIN_EXPECTED_CRC32
-#define JAVELIN_EXPECTED_CRC32 0u  // Set this at build time (e.g., /DJAVELIN_EXPECTED_CRC32=0x12345678)
+#define JAVELIN_EXPECTED_CRC32 0u  // Set at build time, e.g. /DJAVELIN_EXPECTED_CRC32=0x12345678
 #endif
+
+static constexpr int kExitDebuggerDetected = 0x0DEB;
+static constexpr int kExitSuspiciousProcess = 0x0BAD;
+static constexpr int kExitIntegrityFailed = 0x0C0C;
 
 int main() {
     std::cout << kTag << "starting checks...\n";
 
     if (checkDebugger()) {
         std::cerr << kTag << "Debugger detected. Exiting.\n";
-        return 0xDEB; // code for debugger
+        return kExitDebuggerDetected;
     }
 
     if (checkSuspiciousProcesses()) {
         std::cerr << kTag << "Suspicious process detected. Exiting.\n";
-        return 0xBAD; // code for bad process
+        return kExitSuspiciousProcess;
     }
 
     if (JAVELIN_EXPECTED_CRC32 != 0u) {
         if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
             std::cerr << kTag << "Integrity check failed (CRC mismatch). Exiting.\n";
-            return 0xCRC; // custom code (note: non-standard, may be truncated)
+            return kExitIntegrityFailed;
         }
     }
 
