@@ -1,6 +1,6 @@
-// AntiCheat.cpp
+﻿// AntiCheat.cpp
 // Javelin Project - Minimal Anti-Cheat guards
-// Features: debugger detection, suspicious process scan, basic self-integrity (CRC32)
+// Features: debugger detection, suspicious process scan, self-integrity (CRC32 + SHA-256)
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -9,6 +9,10 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <iomanip>
+#include <sstream>
+
+#pragma comment(lib, "bcrypt.lib")
 
 static const char* kTag = "[Javelin AntiCheat] ";
 
@@ -30,6 +34,15 @@ static std::string toLower(std::string s) {
     return s;
 }
 
+static std::string toHex(const std::vector<uint8_t>& data) {
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (uint8_t b : data) {
+        oss << std::setw(2) << static_cast<int>(b);
+    }
+    return oss.str();
+}
+
 // Simple CRC32 (polynomial 0xEDB88320)
 static uint32_t crc32(const std::vector<uint8_t>& data) {
     uint32_t crc = 0xFFFFFFFFu;
@@ -41,6 +54,28 @@ static uint32_t crc32(const std::vector<uint8_t>& data) {
         }
     }
     return ~crc;
+}
+
+// SHA-256 via Windows CNG (BCrypt)
+static std::vector<uint8_t> sha256(const std::vector<uint8_t>& data) {
+    std::vector<uint8_t> hash(32, 0);
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+    if (!BCRYPT_SUCCESS(status)) return hash; // all zeros = failure
+
+    status = BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0);
+    if (!BCRYPT_SUCCESS(status)) { BCryptCloseAlgorithmProvider(hAlg, 0); return hash; }
+
+    status = BCryptHashData(hHash, const_cast<PUCHAR>(data.data()), static_cast<ULONG>(data.size()), 0);
+    if (!BCRYPT_SUCCESS(status)) { BCryptDestroyHash(hHash); BCryptCloseAlgorithmProvider(hAlg, 0); return hash; }
+
+    status = BCryptFinishHash(hHash, hash.data(), static_cast<ULONG>(hash.size()), 0);
+    BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+
+    if (!BCRYPT_SUCCESS(status)) return std::vector<uint8_t>(32, 0);
+    return hash;
 }
 
 static bool readFile(const std::wstring& path, std::vector<uint8_t>& out) {
@@ -59,15 +94,12 @@ static bool readFile(const std::wstring& path, std::vector<uint8_t>& out) {
 static bool checkDebugger() {
     if (IsDebuggerPresent()) return true;
 
-    // Secondary anti-debug: CheckBeingDebugged flag in PEB (best-effort)
 #ifdef _M_IX86
-    // 32-bit: fs:[30h] -> PEB, offset 2 = BeingDebugged (BYTE)
     __try {
         BYTE* peb = *(BYTE**)_readfsdword(0x30);
         if (peb && peb[2]) return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 #elif defined(_M_X64)
-    // 64-bit: gs:[60h] -> PEB
     __try {
         BYTE* peb = *(BYTE**)_readgsqword(0x60);
         if (peb && peb[2]) return true;
@@ -102,7 +134,7 @@ static bool checkSuspiciousProcesses() {
     return false;
 }
 
-static bool checkSelfIntegrity(uint32_t expectedCrc) {
+static bool checkSelfIntegrityCrc32(uint32_t expectedCrc) {
     wchar_t path[MAX_PATH]{};
     if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
 
@@ -113,9 +145,33 @@ static bool checkSelfIntegrity(uint32_t expectedCrc) {
     return current == expectedCrc;
 }
 
-// --- Entry helper (embed a baseline CRC once you ship a build) ---
+static bool checkSelfIntegritySha256(const std::string& expectedHex) {
+    if (expectedHex.empty() || expectedHex.length() != 64) return true; // skip if not configured
+
+    wchar_t path[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
+
+    std::vector<uint8_t> bytes;
+    if (!readFile(path, bytes)) return false;
+
+    std::vector<uint8_t> hash = sha256(bytes);
+
+    // Check if hash is all zeros (crypto API failure)
+    bool allZero = true;
+    for (uint8_t b : hash) { if (b != 0) { allZero = false; break; } }
+    if (allZero) return false;
+
+    std::string currentHex = toHex(hash);
+    return currentHex == expectedHex;
+}
+
+// --- Build-time constants ---
 #ifndef JAVELIN_EXPECTED_CRC32
-#define JAVELIN_EXPECTED_CRC32 0u  // Set this at build time (e.g., /DJAVELIN_EXPECTED_CRC32=0x12345678)
+#define JAVELIN_EXPECTED_CRC32 0u
+#endif
+
+#ifndef JAVELIN_EXPECTED_SHA256
+#define JAVELIN_EXPECTED_SHA256 ""
 #endif
 
 int main() {
@@ -123,19 +179,30 @@ int main() {
 
     if (checkDebugger()) {
         std::cerr << kTag << "Debugger detected. Exiting.\n";
-        return 0xDEB; // code for debugger
+        return 0xDEB;
     }
 
     if (checkSuspiciousProcesses()) {
         std::cerr << kTag << "Suspicious process detected. Exiting.\n";
-        return 0xBAD; // code for bad process
+        return 0xBAD;
     }
 
+    // CRC32 integrity check
     if (JAVELIN_EXPECTED_CRC32 != 0u) {
-        if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
-            std::cerr << kTag << "Integrity check failed (CRC mismatch). Exiting.\n";
-            return 0xCRC; // custom code (note: non-standard, may be truncated)
+        if (!checkSelfIntegrityCrc32(JAVELIN_EXPECTED_CRC32)) {
+            std::cerr << kTag << "Integrity check failed (CRC32 mismatch). Exiting.\n";
+            return 0xCRC;
         }
+        std::cout << kTag << "CRC32 integrity OK.\n";
+    }
+
+    // SHA-256 integrity check (stronger; takes priority if both configured)
+    if (strlen(JAVELIN_EXPECTED_SHA256) == 64) {
+        if (!checkSelfIntegritySha256(JAVELIN_EXPECTED_SHA256)) {
+            std::cerr << kTag << "Integrity check failed (SHA-256 mismatch). Exiting.\n";
+            return 0x256;
+        }
+        std::cout << kTag << "SHA-256 integrity OK.\n";
     }
 
     std::cout << kTag << "All clear. Continue.\n";
