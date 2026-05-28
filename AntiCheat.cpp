@@ -4,6 +4,8 @@
 
 #include <windows.h>
 #include <tlhelp32.h>
+#include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -11,6 +13,9 @@
 #include <algorithm>
 
 static const char* kTag = "[Javelin AntiCheat] ";
+static const int kExitDebugger = 0x0DEB;
+static const int kExitSuspiciousProcess = 0x0BAD;
+static const int kExitIntegrity = 0x0C0D;
 
 // --- Configurable lists ---
 static std::vector<std::string> kSuspiciousProcesses = {
@@ -41,6 +46,30 @@ static uint32_t crc32(const std::vector<uint8_t>& data) {
         }
     }
     return ~crc;
+}
+
+static void zeroExpectedCrc32Bytes(std::vector<uint8_t>& bytes, uint32_t expectedCrc) {
+    if (expectedCrc == 0u || bytes.size() < sizeof(expectedCrc)) {
+        return;
+    }
+
+    uint8_t pattern[sizeof(expectedCrc)] = {
+        static_cast<uint8_t>(expectedCrc & 0xFFu),
+        static_cast<uint8_t>((expectedCrc >> 8) & 0xFFu),
+        static_cast<uint8_t>((expectedCrc >> 16) & 0xFFu),
+        static_cast<uint8_t>((expectedCrc >> 24) & 0xFFu),
+    };
+
+    for (size_t i = 0; i + sizeof(expectedCrc) <= bytes.size(); ++i) {
+        if (std::memcmp(bytes.data() + i, pattern, sizeof(pattern)) == 0) {
+            std::fill(bytes.begin() + i, bytes.begin() + i + sizeof(expectedCrc), 0u);
+        }
+    }
+}
+
+static uint32_t integrityCrc32(std::vector<uint8_t> bytes, uint32_t expectedCrc) {
+    zeroExpectedCrc32Bytes(bytes, expectedCrc);
+    return crc32(bytes);
 }
 
 static bool readFile(const std::wstring& path, std::vector<uint8_t>& out) {
@@ -109,8 +138,19 @@ static bool checkSelfIntegrity(uint32_t expectedCrc) {
     std::vector<uint8_t> bytes;
     if (!readFile(path, bytes)) return false;
 
-    uint32_t current = crc32(bytes);
+    uint32_t current = integrityCrc32(bytes, expectedCrc);
     return current == expectedCrc;
+}
+
+static bool printCurrentIntegrityCrc32() {
+    wchar_t path[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
+
+    std::vector<uint8_t> bytes;
+    if (!readFile(path, bytes)) return false;
+
+    std::cout << std::hex << integrityCrc32(bytes, 0u) << "\n";
+    return true;
 }
 
 // --- Entry helper (embed a baseline CRC once you ship a build) ---
@@ -118,23 +158,27 @@ static bool checkSelfIntegrity(uint32_t expectedCrc) {
 #define JAVELIN_EXPECTED_CRC32 0u  // Set this at build time (e.g., /DJAVELIN_EXPECTED_CRC32=0x12345678)
 #endif
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--print-integrity-crc32") {
+        return printCurrentIntegrityCrc32() ? 0 : kExitIntegrity;
+    }
+
     std::cout << kTag << "starting checks...\n";
 
     if (checkDebugger()) {
         std::cerr << kTag << "Debugger detected. Exiting.\n";
-        return 0xDEB; // code for debugger
+        return kExitDebugger;
     }
 
     if (checkSuspiciousProcesses()) {
         std::cerr << kTag << "Suspicious process detected. Exiting.\n";
-        return 0xBAD; // code for bad process
+        return kExitSuspiciousProcess;
     }
 
     if (JAVELIN_EXPECTED_CRC32 != 0u) {
         if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
             std::cerr << kTag << "Integrity check failed (CRC mismatch). Exiting.\n";
-            return 0xCRC; // custom code (note: non-standard, may be truncated)
+            return kExitIntegrity;
         }
     }
 
