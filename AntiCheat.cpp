@@ -9,8 +9,13 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <cctype>
+#include <cstdint>
 
 static const char* kTag = "[Javelin AntiCheat] ";
+static constexpr int kExitDebuggerDetected = 0xDEB;
+static constexpr int kExitSuspiciousProcess = 0xBAD;
+static constexpr int kExitIntegrityFailure = 0x1A;
 
 // --- Configurable lists ---
 static std::vector<std::string> kSuspiciousProcesses = {
@@ -26,7 +31,9 @@ static std::vector<std::string> kSuspiciousProcesses = {
 
 // --- Utils ---
 static std::string toLower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
     return s;
 }
 
@@ -103,6 +110,8 @@ static bool checkSuspiciousProcesses() {
 }
 
 static bool checkSelfIntegrity(uint32_t expectedCrc) {
+    if (expectedCrc == 0u) return true;
+
     wchar_t path[MAX_PATH]{};
     if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
 
@@ -115,7 +124,7 @@ static bool checkSelfIntegrity(uint32_t expectedCrc) {
 
 // --- Entry helper (embed a baseline CRC once you ship a build) ---
 #ifndef JAVELIN_EXPECTED_CRC32
-#define JAVELIN_EXPECTED_CRC32 0u  // Set this at build time (e.g., /DJAVELIN_EXPECTED_CRC32=0x12345678)
+#define JAVELIN_EXPECTED_CRC32 0u  // Optional: set at build time, e.g. /DJAVELIN_EXPECTED_CRC32=0x12345678
 #endif
 
 int main() {
@@ -123,19 +132,17 @@ int main() {
 
     if (checkDebugger()) {
         std::cerr << kTag << "Debugger detected. Exiting.\n";
-        return 0xDEB; // code for debugger
+        return kExitDebuggerDetected;
     }
 
     if (checkSuspiciousProcesses()) {
         std::cerr << kTag << "Suspicious process detected. Exiting.\n";
-        return 0xBAD; // code for bad process
+        return kExitSuspiciousProcess;
     }
 
-    if (JAVELIN_EXPECTED_CRC32 != 0u) {
-        if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
-            std::cerr << kTag << "Integrity check failed (CRC mismatch). Exiting.\n";
-            return 0xCRC; // custom code (note: non-standard, may be truncated)
-        }
+    if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
+        std::cerr << kTag << "Integrity check failed (CRC32 mismatch). Exiting.\n";
+        return kExitIntegrityFailure;
     }
 
     std::cout << kTag << "All clear. Continue.\n";
