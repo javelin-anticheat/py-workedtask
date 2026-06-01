@@ -1,0 +1,34 @@
+$ python3 -m unittest discover -s tests -v
+test_cpp_configured_crc_accepts_matching_executable (test_integrity.CppIntegrityTests.test_cpp_configured_crc_accepts_matching_executable) ... ok
+test_cpp_configured_crc_rejects_mismatch (test_integrity.CppIntegrityTests.test_cpp_configured_crc_rejects_mismatch) ... ok
+test_python_cli_exits_on_mismatch (test_integrity.PythonIntegrityTests.test_python_cli_exits_on_mismatch) ... ok
+test_python_cli_prints_expected_hash_and_accepts_it (test_integrity.PythonIntegrityTests.test_python_cli_prints_expected_hash_and_accepts_it) ... ok
+test_python_integrity_accepts_matching_hash (test_integrity.PythonIntegrityTests.test_python_integrity_accepts_matching_hash) ... ok
+test_python_integrity_is_disabled_without_expected_hash (test_integrity.PythonIntegrityTests.test_python_integrity_is_disabled_without_expected_hash) ... ok
+test_python_integrity_rejects_mismatch_and_malformed_hash (test_integrity.PythonIntegrityTests.test_python_integrity_rejects_mismatch_and_malformed_hash) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 12.871s
+
+OK
+
+$ c++ -std=c++17 -Wall -Wextra -pedantic -Wl,--build-id=none AntiCheat.cpp -o baseline
+$ baseline --print-integrity-crc32
+0xacab0855
+$ c++ ... -DJAVELIN_EXPECTED_CRC32=0xacab0855 AntiCheat.cpp -o checked
+$ checked
+[Javelin AntiCheat] starting checks...
+[Javelin AntiCheat] All clear. Continue.
+
+$ c++ ... -DJAVELIN_EXPECTED_CRC32=0x00000001 AntiCheat.cpp -o bad && bad
+[Javelin AntiCheat] starting checks...
+[Javelin AntiCheat] Integrity check failed (CRC mismatch). Exiting.
+exit=192
+
+$ python3 anti_cheat.py --print-integrity-sha256
+3303d584a9ce5f0be93621aab7584ec9c6ff01a4192eef0af285e7acbcb658a6
+$ JAVELIN_EXPECTED_SHA256=$SHA python3 anti_cheat.py
+[Javelin AntiCheat] All clear. Continue.
+$ JAVELIN_EXPECTED_SHA256=000... python3 anti_cheat.py
+[Javelin AntiCheat] Integrity check failed (SHA-256 mismatch). Exiting.
+exit=192
