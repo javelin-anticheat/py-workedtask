@@ -2,13 +2,22 @@
 // Javelin Project - Minimal Anti-Cheat guards
 // Features: debugger detection, suspicious process scan, basic self-integrity (CRC32)
 
+#ifdef _WIN32
 #include <windows.h>
 #include <tlhelp32.h>
+#else
+#include <unistd.h>
+#include <dirent.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#endif
+
 #include <iostream>
 #include <fstream>
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <cctype>
 
 static const char* kTag = "[Javelin AntiCheat] ";
 
@@ -21,7 +30,9 @@ static std::vector<std::string> kSuspiciousProcesses = {
     "ida.exe",
     "ida64.exe",
     "scylla.exe",
-    "processhacker.exe"
+    "processhacker.exe",
+    "gdb",
+    "lldb"
 };
 
 // --- Utils ---
@@ -43,6 +54,7 @@ static uint32_t crc32(const std::vector<uint8_t>& data) {
     return ~crc;
 }
 
+#ifdef _WIN32
 static bool readFile(const std::wstring& path, std::vector<uint8_t>& out) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
@@ -54,9 +66,23 @@ static bool readFile(const std::wstring& path, std::vector<uint8_t>& out) {
     if (!f.read(reinterpret_cast<char*>(out.data()), size)) return false;
     return true;
 }
+#else
+static bool readFile(const std::string& path, std::vector<uint8_t>& out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    f.seekg(0, std::ios::end);
+    std::streamsize size = f.tellg();
+    if (size <= 0) return false;
+    f.seekg(0, std::ios::beg);
+    out.resize(static_cast<size_t>(size));
+    if (!f.read(reinterpret_cast<char*>(out.data()), size)) return false;
+    return true;
+}
+#endif
 
 // --- Checks ---
 static bool checkDebugger() {
+#ifdef _WIN32
     if (IsDebuggerPresent()) return true;
 
     // Secondary anti-debug: CheckBeingDebugged flag in PEB (best-effort)
@@ -74,10 +100,23 @@ static bool checkDebugger() {
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 #endif
 
+#else
+    std::ifstream statusFile("/proc/self/status");
+    std::string line;
+    while (std::getline(statusFile, line)) {
+        if (line.rfind("TracerPid:", 0) == 0) {
+            int tracerPid = 0;
+            if (sscanf(line.c_str(), "TracerPid:\t%d", &tracerPid) == 1) {
+                if (tracerPid != 0) return true;
+            }
+        }
+    }
+#endif
     return false;
 }
 
 static bool checkSuspiciousProcesses() {
+#ifdef _WIN32
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return false;
 
@@ -99,12 +138,40 @@ static bool checkSuspiciousProcesses() {
     } while (Process32Next(snap, &pe));
 
     CloseHandle(snap);
+#else
+    DIR* dir = opendir("/proc");
+    if (!dir) return false;
+    struct dirent* ent;
+    while ((ent = readdir(dir)) != nullptr) {
+        if (!isdigit(*ent->d_name)) continue;
+        std::string commPath = std::string("/proc/") + ent->d_name + "/comm";
+        std::ifstream commFile(commPath);
+        std::string commName;
+        if (commFile >> commName) {
+            std::string name = toLower(commName);
+            for (const auto& bad : kSuspiciousProcesses) {
+                if (name == toLower(bad)) {
+                    closedir(dir);
+                    return true;
+                }
+            }
+        }
+    }
+    closedir(dir);
+#endif
     return false;
 }
 
 static bool checkSelfIntegrity(uint32_t expectedCrc) {
+#ifdef _WIN32
     wchar_t path[MAX_PATH]{};
     if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
+#else
+    char path[4096]{};
+    ssize_t count = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (count <= 0) return false;
+    path[count] = '\0';
+#endif
 
     std::vector<uint8_t> bytes;
     if (!readFile(path, bytes)) return false;
@@ -134,7 +201,7 @@ int main() {
     if (JAVELIN_EXPECTED_CRC32 != 0u) {
         if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
             std::cerr << kTag << "Integrity check failed (CRC mismatch). Exiting.\n";
-            return 0xCRC; // custom code (note: non-standard, may be truncated)
+            return 0x0C8C; // fixed hex syntax from 0xCRC
         }
     }
 
