@@ -1,6 +1,7 @@
 import sys
 import subprocess
 import os
+import hashlib
 
 TAG = "[Javelin AntiCheat] "
 
@@ -62,6 +63,20 @@ def check_suspicious_processes() -> bool:
         pass
     return False
 
+def check_self_integrity() -> bool:
+    expected_hash = os.environ.get("JAVELIN_EXPECTED_SHA256")
+    if not expected_hash:
+        return False
+        
+    try:
+        script_path = os.path.abspath(__file__)
+        with open(script_path, "rb") as f:
+            file_bytes = f.read()
+        current_hash = hashlib.sha256(file_bytes).hexdigest()
+        return current_hash.lower() != expected_hash.lower()
+    except Exception:
+        return True
+
 def main():
     print(f"{TAG}starting checks...")
     
@@ -72,6 +87,10 @@ def main():
     if check_suspicious_processes():
         print(f"{TAG}Suspicious process detected. Exiting.", file=sys.stderr)
         sys.exit(0xBAD)
+        
+    if check_self_integrity():
+        print(f"{TAG}Integrity check failed (SHA-256 mismatch). Exiting.", file=sys.stderr)
+        sys.exit(0x0C8C)
         
     print(f"{TAG}All clear. Continue.")
     sys.exit(0)
