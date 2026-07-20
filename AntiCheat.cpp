@@ -131,10 +131,12 @@ int main() {
         return 0xBAD; // code for bad process
     }
 
+    // Optional build-time integrity: non-zero expected CRC enables the check.
+    // On mismatch: guarded non-zero exit (tamper detected).
     if (JAVELIN_EXPECTED_CRC32 != 0u) {
         if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
             std::cerr << kTag << "Integrity check failed (CRC mismatch). Exiting.\n";
-            return 0xCRC; // custom code (note: non-standard, may be truncated)
+            return 0xC1; // guarded integrity failure
         }
     }
 
