@@ -118,7 +118,20 @@ static bool checkSelfIntegrity(uint32_t expectedCrc) {
 #define JAVELIN_EXPECTED_CRC32 0u  // Set this at build time (e.g., /DJAVELIN_EXPECTED_CRC32=0x12345678)
 #endif
 
-int main() {
+int main(int argc, char* argv[]) {
+    // Check for --print-integrity flag
+    if (argc > 1 && std::string(argv[1]) == "--print-integrity") {
+        wchar_t path[MAX_PATH]{};
+        if (GetModuleFileNameW(nullptr, path, MAX_PATH)) {
+            std::vector<uint8_t> bytes;
+            if (readFile(path, bytes)) {
+                std::cout << std::hex << crc32(bytes) << std::endl;
+                return 0;
+            }
+        }
+        return 1;
+    }
+
     std::cout << kTag << "starting checks...\n";
 
     if (checkDebugger()) {
@@ -134,7 +147,7 @@ int main() {
     if (JAVELIN_EXPECTED_CRC32 != 0u) {
         if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
             std::cerr << kTag << "Integrity check failed (CRC mismatch). Exiting.\n";
-            return 0xCRC; // custom code (note: non-standard, may be truncated)
+            return 0xCEC; // Custom code for integrity failure
         }
     }
 
