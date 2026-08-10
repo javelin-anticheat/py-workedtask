@@ -1,0 +1,51 @@
+Javelin integrity verification demo
+===================================
+
+Environment:
+- Python 3.14.6
+- MinGW-w64 GCC 16.1
+- Wine 11.14
+
+$ python3 -m unittest discover -s tests -v
+test_expected_hash_is_optional_and_normalized ... ok
+test_expected_hash_rejects_invalid_value ... ok
+test_integrity_check_detects_modified_script ... ok
+test_main_accepts_matching_hash ... ok
+test_main_guards_on_mismatch ... ok
+test_print_hash_ignores_configured_expected_hash ... ok
+test_sha256_file_and_integrity_match ... ok
+
+Ran 7 tests in 0.002s
+OK
+
+$ x86_64-w64-mingw32-g++ -std=c++17 -Wall -Wextra -Wpedantic \
+    -Werror -static AntiCheat.cpp -o AntiCheat-baseline.exe
+$ wine ./AntiCheat-baseline.exe --print-self-crc32
+0xF6D0CF3C
+
+$ x86_64-w64-mingw32-g++ -std=c++17 -Wall -Wextra -Wpedantic \
+    -Werror -static -DJAVELIN_EXPECTED_CRC32=0xF6D0CF3C \
+    AntiCheat.cpp -o AntiCheat-verified.exe
+$ wine ./AntiCheat-verified.exe --print-self-crc32
+0xF6D0CF3C
+$ wine ./AntiCheat-verified.exe
+[Javelin AntiCheat] starting checks...
+[Javelin AntiCheat] All clear. Continue.
+
+$ cp AntiCheat-verified.exe AntiCheat-tampered.exe
+$ truncate -s +1 AntiCheat-tampered.exe
+$ wine ./AntiCheat-tampered.exe
+[Javelin AntiCheat] starting checks...
+[Javelin AntiCheat] Integrity check failed (CRC mismatch). Exiting.
+exit=12
+
+$ JAVELIN_EXPECTED_SHA256=1b3a697e1fae3e42b3868de8a5a7beb1b7083272846270265a8c3d195ac989b0 \
+    python3 anti_cheat.py
+[Javelin AntiCheat] All clear. Continue.
+
+$ JAVELIN_EXPECTED_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
+    python3 anti_cheat.py
+[Javelin AntiCheat] Integrity check failed (SHA-256 mismatch). Exiting.
+exit=12
+
+The Windows exit value is 0xC0C; Wine reports its low byte (12) to the POSIX shell.
