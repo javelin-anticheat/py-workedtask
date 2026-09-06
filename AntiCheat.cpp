@@ -9,6 +9,12 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <cstdint>
+#include <cwctype>
+#include <filesystem>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 static const char* kTag = "[Javelin AntiCheat] ";
 
@@ -25,11 +31,6 @@ static std::vector<std::string> kSuspiciousProcesses = {
 };
 
 // --- Utils ---
-static std::string toLower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-    return s;
-}
-
 // Simple CRC32 (polynomial 0xEDB88320)
 static uint32_t crc32(const std::vector<uint8_t>& data) {
     uint32_t crc = 0xFFFFFFFFu;
@@ -44,7 +45,7 @@ static uint32_t crc32(const std::vector<uint8_t>& data) {
 }
 
 static bool readFile(const std::wstring& path, std::vector<uint8_t>& out) {
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(std::filesystem::path(path), std::ios::binary);
     if (!f) return false;
     f.seekg(0, std::ios::end);
     std::streamsize size = f.tellg();
@@ -60,16 +61,16 @@ static bool checkDebugger() {
     if (IsDebuggerPresent()) return true;
 
     // Secondary anti-debug: CheckBeingDebugged flag in PEB (best-effort)
-#ifdef _M_IX86
+#if defined(_MSC_VER) && defined(_M_IX86)
     // 32-bit: fs:[30h] -> PEB, offset 2 = BeingDebugged (BYTE)
     __try {
-        BYTE* peb = *(BYTE**)_readfsdword(0x30);
+        BYTE* peb = reinterpret_cast<BYTE*>(__readfsdword(0x30));
         if (peb && peb[2]) return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
-#elif defined(_M_X64)
+#elif defined(_MSC_VER) && defined(_M_X64)
     // 64-bit: gs:[60h] -> PEB
     __try {
-        BYTE* peb = *(BYTE**)_readgsqword(0x60);
+        BYTE* peb = reinterpret_cast<BYTE*>(__readgsqword(0x60));
         if (peb && peb[2]) return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 #endif
@@ -81,30 +82,32 @@ static bool checkSuspiciousProcesses() {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return false;
 
-    PROCESSENTRY32 pe{};
+    PROCESSENTRY32W pe{};
     pe.dwSize = sizeof(pe);
-    if (!Process32First(snap, &pe)) {
+    if (!Process32FirstW(snap, &pe)) {
         CloseHandle(snap);
         return false;
     }
 
     do {
-        std::string name = toLower(pe.szExeFile);
+        std::wstring name(pe.szExeFile);
+        std::transform(name.begin(), name.end(), name.begin(), std::towlower);
         for (const auto& bad : kSuspiciousProcesses) {
-            if (name == toLower(bad)) {
+            if (name == std::wstring(bad.begin(), bad.end())) {
                 CloseHandle(snap);
                 return true;
             }
         }
-    } while (Process32Next(snap, &pe));
+    } while (Process32NextW(snap, &pe));
 
     CloseHandle(snap);
     return false;
 }
 
 static bool checkSelfIntegrity(uint32_t expectedCrc) {
-    wchar_t path[MAX_PATH]{};
-    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
+    wchar_t path[32768]{};
+    DWORD length = GetModuleFileNameW(nullptr, path, 32768);
+    if (length == 0 || length >= 32768) return false;
 
     std::vector<uint8_t> bytes;
     if (!readFile(path, bytes)) return false;
@@ -113,10 +116,8 @@ static bool checkSelfIntegrity(uint32_t expectedCrc) {
     return current == expectedCrc;
 }
 
-// --- Entry helper (embed a baseline CRC once you ship a build) ---
-#ifndef JAVELIN_EXPECTED_CRC32
-#define JAVELIN_EXPECTED_CRC32 0u  // Set this at build time (e.g., /DJAVELIN_EXPECTED_CRC32=0x12345678)
-#endif
+// Define JAVELIN_EXPECTED_CRC32 at build time and seal the final executable.
+// An omitted macro disables the check; a defined zero is a valid CRC.
 
 int main() {
     std::cout << kTag << "starting checks...\n";
@@ -131,12 +132,14 @@ int main() {
         return 0xBAD; // code for bad process
     }
 
-    if (JAVELIN_EXPECTED_CRC32 != 0u) {
+#ifdef JAVELIN_EXPECTED_CRC32
+    {
         if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
             std::cerr << kTag << "Integrity check failed (CRC mismatch). Exiting.\n";
-            return 0xCRC; // custom code (note: non-standard, may be truncated)
+            return 3;
         }
     }
+#endif
 
     std::cout << kTag << "All clear. Continue.\n";
     return 0;
