@@ -1,6 +1,6 @@
 // AntiCheat.cpp
 // Javelin Project - Minimal Anti-Cheat guards
-// Features: debugger detection, suspicious process scan, basic self-integrity (CRC32)
+// Features: debugger detection, suspicious process scan, integrity verification (SHA-256 + CRC32)
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -9,6 +9,8 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <wincrypt.h>
+#include <iomanip>
 
 static const char* kTag = "[Javelin AntiCheat] ";
 
@@ -49,12 +51,55 @@ static bool readFile(const std::wstring& path, std::vector<uint8_t>& out) {
     f.seekg(0, std::ios::end);
     std::streamsize size = f.tellg();
     if (size <= 0) return false;
-    f.seekg(0, std::ios::beg);
-    out.resize(static_cast<size_t>(size));
-    if (!f.read(reinterpret_cast<char*>(out.data()), size)) return false;
     return true;
 }
 
+// SHA-256 hash using Windows CryptoAPI
+static bool sha256(const std::vector<uint8_t>& data, std::vector<uint8_t>& hash) {
+    HCRYPTPROV hProv = 0;
+    HCRYPTHASH hHash = 0;
+    bool result = false;
+
+    if (!CryptAcquireContext(&hProv, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
+        return false;
+    }
+
+    if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
+        CryptReleaseContext(hProv, 0);
+        return false;
+    }
+
+    if (!CryptHashData(hHash, data.data(), static_cast<DWORD>(data.size()), 0)) {
+        CryptDestroyHash(hHash);
+        CryptReleaseContext(hProv, 0);
+        return false;
+    }
+
+    DWORD hashLen = 32; // SHA-256 = 32 bytes
+    hash.resize(hashLen);
+    if (CryptGetHashParam(hHash, HP_HASHVAL, hash.data(), &hashLen, 0)) {
+        result = true;
+    }
+
+    CryptDestroyHash(hHash);
+    CryptReleaseContext(hProv, 0);
+    return result;
+}
+
+static std::string bytesToHex(const std::vector<uint8_t>& bytes) {
+    std::string hex;
+    hex.reserve(bytes.size() * 2);
+    for (uint8_t b : bytes) {
+        char buf[3];
+        snprintf(buf, sizeof(buf), "%02x", b);
+        hex += buf;
+    }
+    return hex;
+}
+
+// --- Checks ---
+static bool checkDebugger() {
+    if (IsDebuggerPresent()) return true;
 // --- Checks ---
 static bool checkDebugger() {
     if (IsDebuggerPresent()) return true;
@@ -130,14 +175,48 @@ int main() {
         std::cerr << kTag << "Suspicious process detected. Exiting.\n";
         return 0xBAD; // code for bad process
     }
+    return current == expectedCrc;
+}
+
+// SHA-256 integrity verification
+static bool checkSelfIntegritySHA256(const char* expectedHash) {
+    if (!expectedHash || expectedHash[0] == '\0') return true; // skip if not set
+
+    wchar_t path[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
+
+    std::vector<uint8_t> bytes;
+    if (!readFile(path, bytes)) return false;
+
+    std::vector<uint8_t> hash;
+    if (!sha256(bytes, hash)) return false;
+
+    std::string currentHex = bytesToHex(hash);
+    return currentHex == toLower(std::string(expectedHash));
+}
+
+// --- Entry helper (embed a baseline CRC once you ship a build) ---
+#ifndef JAVELIN_EXPECTED_CRC32
+#define JAVELIN_EXPECTED_CRC32 0u  // Set this at build time (e.g., /DJAVELIN_EXPECTED_CRC32=0x12345678)
+#endif
+
+#ifndef JAVELIN_EXPECTED_SHA256
+#define JAVELIN_EXPECTED_SHA256 ""  // Set at build time (e.g., /DJAVELIN_EXPECTED_SHA256=\"abc123...\")
+#endif
+
+int main() {
+    std::cout << kTag << "starting checks...\n";
+
+    }
+
+    // SHA-256 integrity check (preferred, stronger than CRC32)
+    if (JAVELIN_EXPECTED_SHA256[0] != '\0') {
+        if (!checkSelfIntegritySHA256(JAVELIN_EXPECTED_SHA256)) {
+            std::cerr << kTag << "Integrity check failed (SHA-256 mismatch). Exiting.\n";
+            return 0x256; // code for SHA-256 failure
+        }
+    }
 
     if (JAVELIN_EXPECTED_CRC32 != 0u) {
         if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
             std::cerr << kTag << "Integrity check failed (CRC mismatch). Exiting.\n";
-            return 0xCRC; // custom code (note: non-standard, may be truncated)
-        }
-    }
-
-    std::cout << kTag << "All clear. Continue.\n";
-    return 0;
-}
