@@ -118,6 +118,15 @@ static bool checkSelfIntegrity(uint32_t expectedCrc) {
 #define JAVELIN_EXPECTED_CRC32 0u  // Set this at build time (e.g., /DJAVELIN_EXPECTED_CRC32=0x12345678)
 #endif
 
+static uint32_t resolveExpectedCrc32() {
+    if (const char* envCrc = std::getenv("JAVELIN_EXPECTED_CRC32")) {
+        if (envCrc[0] != '\0') {
+            return static_cast<uint32_t>(std::strtoul(envCrc, nullptr, 0));
+        }
+    }
+    return JAVELIN_EXPECTED_CRC32;
+}
+
 int main() {
     std::cout << kTag << "starting checks...\n";
 
@@ -131,8 +140,9 @@ int main() {
         return 0xBAD; // code for bad process
     }
 
-    if (JAVELIN_EXPECTED_CRC32 != 0u) {
-        if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
+    const uint32_t expectedCrc = resolveExpectedCrc32();
+    if (expectedCrc != 0u) {
+        if (!checkSelfIntegrity(expectedCrc)) {
             std::cerr << kTag << "Integrity check failed (CRC mismatch). Exiting.\n";
             return 0xCRC; // custom code (note: non-standard, may be truncated)
         }
