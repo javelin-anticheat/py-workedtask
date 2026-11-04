@@ -1,0 +1,13 @@
+C++: finalized executable
+[Javelin AntiCheat] starting checks...
+[Javelin AntiCheat] Executable integrity verified.
+C++: one changed byte in a temporary copy
+[Javelin AntiCheat] starting checks...
+[Javelin AntiCheat] Integrity check failed (CRC mismatch or unreadable executable). Exiting.
+Observed exit status: 3 (expected 3)
+Python: matching trusted SHA-256
+[Javelin AntiCheat] Script integrity verified.
+[Javelin AntiCheat] All clear. Continue.
+Python: changed temporary script, unchanged expected SHA-256
+[Javelin AntiCheat] Integrity check failed: SHA-256 mismatch. Exiting.
+Observed exit status: 3 (expected 3)

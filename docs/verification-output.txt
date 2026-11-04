@@ -1,0 +1,17 @@
+Finalized AntiCheat.exe: whole-file CRC32 = 0xC0DE2026
+[Javelin AntiCheat] starting checks...
+[Javelin AntiCheat] Executable integrity verified.
+Native CRC vectors, streamed file, missing file, and directory checks passed.
+test_rejects_disabled_out_of_range_and_non_executable (test_integrity.FinalizerTests.test_rejects_disabled_out_of_range_and_non_executable) ... ok
+test_whole_file_crc_matches_and_refinalization_is_idempotent (test_integrity.FinalizerTests.test_whole_file_crc_matches_and_refinalization_is_idempotent) ... ok
+test_running_image_passes_and_modified_overlay_fails (test_integrity.NativeIntegrationTests.test_running_image_passes_and_modified_overlay_fails) ... ok
+test_unfinalized_executable_fails_and_zero_baseline_skips (test_integrity.NativeIntegrationTests.test_unfinalized_executable_fails_and_zero_baseline_skips) ... ok
+test_entry_point_hashes_own_script_not_current_directory (test_integrity.ScriptIntegrityTests.test_entry_point_hashes_own_script_not_current_directory) ... ok
+test_hashes_all_bytes_across_chunks_and_accepts_uppercase (test_integrity.ScriptIntegrityTests.test_hashes_all_bytes_across_chunks_and_accepts_uppercase) ... ok
+test_unreadable_script_fails_closed (test_integrity.ScriptIntegrityTests.test_unreadable_script_fails_closed) ... ok
+test_unset_is_optional_but_empty_is_invalid (test_integrity.ScriptIntegrityTests.test_unset_is_optional_but_empty_is_invalid) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.503s
+
+OK
