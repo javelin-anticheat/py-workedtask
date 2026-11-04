@@ -1,14 +1,18 @@
 // AntiCheat.cpp
 // Javelin Project - Minimal Anti-Cheat guards
-// Features: debugger detection, suspicious process scan, basic self-integrity (CRC32)
+// Features: debugger detection, suspicious process scan, self-integrity (CRC32 + SHA-256)
 
 #include <windows.h>
+#include <wincrypt.h>
 #include <tlhelp32.h>
 #include <iostream>
 #include <fstream>
+#include <sstream>
+#include <iomanip>
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <cstdint>
 
 static const char* kTag = "[Javelin AntiCheat] ";
 
@@ -43,6 +47,36 @@ static uint32_t crc32(const std::vector<uint8_t>& data) {
     return ~crc;
 }
 
+// SHA-256 using Windows CryptoAPI (zero external dependencies)
+static std::string sha256Hex(const std::vector<uint8_t>& data) {
+    HCRYPTPROV hProv = 0;
+    HCRYPTHASH hHash = 0;
+    if (!CryptAcquireContextW(&hProv, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
+        return "";
+    }
+    if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
+        CryptReleaseContext(hProv, 0);
+        return "";
+    }
+    if (!data.empty() && !CryptHashData(hHash, data.data(), static_cast<DWORD>(data.size()), 0)) {
+        CryptDestroyHash(hHash);
+        CryptReleaseContext(hProv, 0);
+        return "";
+    }
+    BYTE hash[32]{};
+    DWORD hashLen = sizeof(hash);
+    std::ostringstream oss;
+    if (CryptGetHashParam(hHash, HP_HASHVAL, hash, &hashLen, 0)) {
+        oss << std::hex << std::setfill('0');
+        for (DWORD i = 0; i < hashLen; ++i) {
+            oss << std::setw(2) << static_cast<unsigned int>(hash[i]);
+        }
+    }
+    CryptDestroyHash(hHash);
+    CryptReleaseContext(hProv, 0);
+    return toLower(oss.str());
+}
+
 static bool readFile(const std::wstring& path, std::vector<uint8_t>& out) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
@@ -55,19 +89,22 @@ static bool readFile(const std::wstring& path, std::vector<uint8_t>& out) {
     return true;
 }
 
+static bool readExecutableBytes(std::vector<uint8_t>& bytes) {
+    wchar_t path[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
+    return readFile(path, bytes);
+}
+
 // --- Checks ---
 static bool checkDebugger() {
     if (IsDebuggerPresent()) return true;
 
-    // Secondary anti-debug: CheckBeingDebugged flag in PEB (best-effort)
 #ifdef _M_IX86
-    // 32-bit: fs:[30h] -> PEB, offset 2 = BeingDebugged (BYTE)
     __try {
         BYTE* peb = *(BYTE**)_readfsdword(0x30);
         if (peb && peb[2]) return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 #elif defined(_M_X64)
-    // 64-bit: gs:[60h] -> PEB
     __try {
         BYTE* peb = *(BYTE**)_readgsqword(0x60);
         if (peb && peb[2]) return true;
@@ -102,39 +139,63 @@ static bool checkSuspiciousProcesses() {
     return false;
 }
 
-static bool checkSelfIntegrity(uint32_t expectedCrc) {
-    wchar_t path[MAX_PATH]{};
-    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
-
+static bool checkSelfIntegrityCrc32(uint32_t expectedCrc) {
     std::vector<uint8_t> bytes;
-    if (!readFile(path, bytes)) return false;
-
-    uint32_t current = crc32(bytes);
-    return current == expectedCrc;
+    if (!readExecutableBytes(bytes)) return false;
+    return crc32(bytes) == expectedCrc;
 }
 
-// --- Entry helper (embed a baseline CRC once you ship a build) ---
+static bool checkSelfIntegritySha256(const std::string& expectedSha256) {
+    std::vector<uint8_t> bytes;
+    if (!readExecutableBytes(bytes)) return false;
+    std::string current = sha256Hex(bytes);
+    return !current.empty() && current == toLower(expectedSha256);
+}
+
+// --- Build-time constants ---
 #ifndef JAVELIN_EXPECTED_CRC32
-#define JAVELIN_EXPECTED_CRC32 0u  // Set this at build time (e.g., /DJAVELIN_EXPECTED_CRC32=0x12345678)
+#define JAVELIN_EXPECTED_CRC32 0u  // e.g. /DJAVELIN_EXPECTED_CRC32=0x12345678u
 #endif
 
-int main() {
+#ifndef JAVELIN_EXPECTED_SHA256
+#define JAVELIN_EXPECTED_SHA256 "" // e.g. /DJAVELIN_EXPECTED_SHA256="\"e3b0c442...\""
+#endif
+
+int main(int argc, char* argv[]) {
+    if (argc > 1 && std::string(argv[1]) == "--print-hash") {
+        std::vector<uint8_t> bytes;
+        if (readExecutableBytes(bytes)) {
+            std::cout << "CRC32:  0x" << std::hex << std::uppercase << crc32(bytes) << "\n";
+            std::cout << "SHA256: " << sha256Hex(bytes) << "\n";
+            return 0;
+        }
+        return 1;
+    }
+
     std::cout << kTag << "starting checks...\n";
 
     if (checkDebugger()) {
         std::cerr << kTag << "Debugger detected. Exiting.\n";
-        return 0xDEB; // code for debugger
+        return 0xDEB;
     }
 
     if (checkSuspiciousProcesses()) {
         std::cerr << kTag << "Suspicious process detected. Exiting.\n";
-        return 0xBAD; // code for bad process
+        return 0xBAD;
     }
 
     if (JAVELIN_EXPECTED_CRC32 != 0u) {
-        if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
-            std::cerr << kTag << "Integrity check failed (CRC mismatch). Exiting.\n";
-            return 0xCRC; // custom code (note: non-standard, may be truncated)
+        if (!checkSelfIntegrityCrc32(JAVELIN_EXPECTED_CRC32)) {
+            std::cerr << kTag << "Integrity check failed (CRC32 mismatch). Guarded exit.\n";
+            return 0xC4C;
+        }
+    }
+
+    std::string expectedSha = JAVELIN_EXPECTED_SHA256;
+    if (!expectedSha.empty()) {
+        if (!checkSelfIntegritySha256(expectedSha)) {
+            std::cerr << kTag << "Integrity check failed (SHA-256 mismatch). Guarded exit.\n";
+            return 0x5A2;
         }
     }
 
