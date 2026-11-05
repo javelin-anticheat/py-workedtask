@@ -1,0 +1,288 @@
+# 📦 Feature: Add Integrity Verification (Hash of Executable/Script)
+
+## Overview
+The goal is to embed an **integrity check** into both the C++ and Python versions of the project.  
+When the binary/script runs it will:
+
+1. Compute a cryptographic hash (SHA‑256) of the **running executable / script file**.  
+2. Compare the computed hash with a **build‑time constant** that represents the expected value.  
+3. Abort (or raise an exception) if the values differ, indicating that the binary/script was tampered with.
+
+The check must be **optional** (can be disabled at compile‑time / runtime) and must not significantly impact start‑up performance.
+
+---
+
+## Table of Contents
+1. [Design Decisions](#design-decisions)  
+2. [C++ Implementation](#cpp-implementation)  
+   - 2.1 [Hash Algorithm Choice](#hash-algorithm-choice)  
+   - 2.2 [Build‑time Constant Generation](#build-time-constant-generation)  
+   - 2.3 [Runtime Verification Code](#runtime-verification-code)  
+   - 2.4 [Optional Enabling / Disabling](#optional-enabling--disabling)  
+   - 2.5 [Cross‑Platform File Access](#cross-platform-file-access)  
+   - 2.6 [CMake Integration](#cmake-integration)  
+   - 2.7 [Testing & CI](#testing--ci)  
+3. [Python Implementation](#python-implementation)  
+   - 3.1 [Hash Calculation](#hash-calculation)  
+   - 3.2 [Embedding Expected Hash](#embedding-expected-hash)  
+   - 3.3 [Optional Enable Flag](#optional-enable-flag)  
+   - 3.4 [Packaging Considerations](#packaging-considerations)  
+   - 3.5 [Testing & CI](#testing--ci-1)  
+4. [Security & Hardening Notes](#security--hardening-notes)  
+5. [Performance Impact](#performance-impact)  
+6. [Future Enhancements](#future-enhancements)  
+7. [References](#references)  
+
+---
+
+## Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| **SHA‑256** as primary hash algorithm | Strong, widely available in both C++ (`openssl`/`CryptoPP`/`std::hash` in C++20) and Python (`hashlib`). Faster than SHA‑512 while still cryptographically secure. |
+| **Optional integrity verification** | Some deployments (e.g., dev builds, CI runners) may not want the check; also allows users to disable for performance or debugging. |
+| **Build‑time generation** of the expected hash | Guarantees the constant reflects the exact binary/script shipped; avoids manual copy‑paste errors. |
+| **Fail‑fast** – abort/startup error if hash mismatch | Tampering is a security failure, so the program should not continue in an unknown state. |
+| **Minimal dependencies** – use existing crypto libs (OpenSSL on C++, `hashlib` on Python) | Reduces build friction and avoids adding a heavy third‑party hash implementation. |
+| **Cross‑platform** – Windows, macOS, Linux support | Use portable APIs (`std::filesystem`, `GetModuleFileNameW`, `dladdr`, etc.) to locate the current executable. |
+
+---
+
+## C++ Implementation
+
+### 1. Hash Algorithm Choice <a name="hash-algorithm-choice"></a>
+
+- **Primary**: SHA‑256 via **OpenSSL** (`EVP_Digest*` API).  
+- **Fallback** (if OpenSSL not available): **CryptoPP** or a small header‑only SHA‑256 implementation.
+
+> **Why not CRC32?**  
+> CRC32 is fast but not cryptographically strong; an attacker can easily craft a new file with the same CRC. SHA‑256 provides tamper‑evidence.
+
+### 2. Build‑time Constant Generation <a name="build-time-constant-generation"></a>
+
+#### 2.1 CMake Custom Command
+
+```cmake
+# CMakeLists.txt (excerpt)
+find_package(OpenSSL REQUIRED)
+
+# Helper script that computes SHA-256 of the built binary
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/hash.inc
+    COMMAND ${CMAKE_COMMAND} -E echo_append "// Auto‑generated file – do NOT edit\n"
+    COMMAND ${CMAKE_COMMAND} -E echo_append "constexpr const char* EXPECTED_HASH = \""
+    COMMAND ${CMAKE_COMMAND} -E sha256sum $<TARGET_FILE:my_app> | cut -d' ' -f1
+    COMMAND ${CMAKE_COMMAND} -E echo_append "\";\n" > ${CMAKE_CURRENT_BINARY_DIR}/hash.inc
+    DEPENDS my_app
+    COMMENT "Generating expected SHA‑256 hash for integrity check"
+)
+
+add_custom_target(generate_hash ALL DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/hash.inc)
+
+target_sources(my_app PRIVATE
+    src/integrity.cpp
+    ${CMAKE_CURRENT_BINARY_DIR}/hash.inc   # will be included in source
+)
+
+add_dependencies(my_app generate_hash)
+```
+
+- **Explanation**:  
+  - After `my_app` is linked, CMake runs a command that computes SHA‑256 of the final binary and writes a header `hash.inc` containing a `constexpr` string.  
+  - The header is compiled into the binary, so the expected hash is baked at **build time**.
+
+> **Windows note:** `sha256sum` isn’t native. Provide a small PowerShell snippet or a custom CMake script that uses OpenSSL CLI (`openssl dgst -sha256`). Example:
+
+```cmake
+if(WIN32)
+    set(SHA256_CMD "powershell -Command \"(Get-FileHash -Algorithm SHA256 '${TARGET_PATH}').Hash\"")
+else()
+    set(SHA256_CMD "sha256sum ${TARGET_PATH} | cut -d' ' -f1")
+endif()
+```
+
+#### 2.2 Header File (`hash.inc`)
+
+```cpp
+// hash.inc – generated by CMake
+constexpr const char* EXPECTED_HASH = "3f2a1e9b..."; // 64‑hex chars
+```
+
+### 3. Runtime Verification Code <a name="runtime-verification-code"></a>
+
+#### 3.1 Locate the Running Executable
+
+```cpp
+#include <filesystem>
+#include <string>
+
+#if defined(_WIN32)
+#include <windows.h>
+std::filesystem::path get_self_path() {
+    wchar_t path[MAX_PATH];
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    return std::filesystem::path(path);
+}
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+std::filesystem::path get_self_path() {
+    uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size); // get required size
+    std::vector<char> buf(size);
+    _NSGetExecutablePath(buf.data(), &size);
+    return std::filesystem::weakly_canonical(std::filesystem::path(buf.data()));
+}
+#else // Linux + others
+#include <unistd.h>
+std::filesystem::path get_self_path() {
+    char path[PATH_MAX];
+    ssize_t len = ::readlink("/proc/self/exe", path, sizeof(path)-1);
+    if (len == -1) throw std::runtime_error("cannot read /proc/self/exe");
+    path[len] = '\0';
+    return std::filesystem::weakly_canonical(std::filesystem::path(path));
+}
+#endif
+```
+
+#### 3.2 Compute SHA‑256 of the File
+
+```cpp
+#include <openssl/evp.h>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+
+std::string sha256_of_file(const std::filesystem::path& p) {
+    constexpr std::size_t BUF_SIZE = 1 << 16; // 64 KiB
+    unsigned char buf[BUF_SIZE];
+
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr);
+
+    std::ifstream ifs(p, std::ios::binary);
+    if (!ifs) throw std::runtime_error("Cannot open file: " + p.string());
+
+    while (ifs) {
+        ifs.read(reinterpret_cast<char*>(buf), BUF_SIZE);
+        std::streamsize read = ifs.gcount();
+        if (read > 0)
+            EVP_DigestUpdate(ctx, buf, static_cast<std::size_t>(read));
+    }
+
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_len = 0;
+    EVP_DigestFinal_ex(ctx, digest, &digest_len);
+    EVP_MD_CTX_free(ctx);
+
+    std::ostringstream oss;
+    for (unsigned i = 0; i < digest_len; ++i)
+        oss << std::hex << std::setw(2) << std::setfill('0')
+            << static_cast<int>(digest[i]);
+    return oss.str();
+}
+```
+
+#### 3.3 Verification Routine
+
+```cpp
+#include <iostream>
+#include "hash.inc"   // generated header with EXPECTED_HASH
+
+bool verify_integrity(bool fatal = true) {
+#ifndef DISABLE_INTEGRITY_CHECK
+    try {
+        const auto exe_path = get_self_path();
+        const std::string actual = sha256_of_file(exe_path);
+        if (actual != EXPECTED_HASH) {
+            std::cerr << "[ERROR] Integrity check failed!\n"
+                      << "  Expected: " << EXPECTED_HASH << "\n"
+                      << "  Actual  : " << actual << "\n";
+            if (fatal) std::terminate();   // or std::exit(EXIT_FAILURE);
+            return false;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[ERROR] Integrity verification exception: " << e.what() << "\n";
+        if (fatal) std::terminate();
+        return false;
+    }
+#endif
+    return true;
+}
+```
+
+- The macro `DISABLE_INTEGRITY_CHECK` can be defined in the build configuration to completely strip the check (e.g., for debug builds).
+
+#### 3.4 Integration Point
+
+Call `verify_integrity()` as early as possible, e.g., at the start of `main()`:
+
+```cpp
+int main(int argc, char** argv) {
+    verify_integrity();   // aborts if tampered
+    // ... rest of the program ...
+}
+```
+
+### 4. Optional Enabling / Disabling <a name="optional-enabling--disabling"></a>
+
+| Method | How to use |
+|--------|------------|
+| **Compile‑time** (`DISABLE_INTEGRITY_CHECK`) | Add `-DDISABLE_INTEGRITY_CHECK` to the compiler flags (CMake: `target_compile_definitions(my_app PRIVATE DISABLE_INTEGRITY_CHECK)`). |
+| **Runtime** (`--no-integrity` flag) | Parse command line; if set, call `verify_integrity(false)` (non‑fatal) or skip call entirely. |
+| **Environment variable** (`INTEGRITY_CHECK=0`) | In `main`, read `std::getenv("INTEGRITY_CHECK")` and conditionally call. |
+
+### 5. Cross‑Platform File Access <a name="cross-platform-file-access"></a>
+
+- **Windows**: `GetModuleFileNameW` returns the path of the current module.
+- **macOS**: `_NSGetExecutablePath` + `realpath` (or `std::filesystem::canonical`).
+- **Linux**: `/proc/self/exe` symlink.
+- **Other Unix**: Fallback to `dladdr` on the address of `main` (works on many BSDs).
+
+All functions return a `std::filesystem::path`, which ensures proper Unicode handling on Windows.
+
+### 6. CMake Integration <a name="cmake-integration"></a>
+
+```cmake
+# Options
+option(ENABLE_INTEGRITY_CHECK "Enable runtime integrity verification" ON)
+
+if(ENABLE_INTEGRITY_CHECK)
+    add_definitions(-DENABLE_INTEGRITY_CHECK)
+else()
+    add_definitions(-DDISABLE_INTEGRITY_CHECK)
+endif()
+
+# Ensure OpenSSL is linked
+target_link_libraries(my_app PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+
+# Add a target to regenerate the hash when the binary changes (post‑build)
+add_custom_command(TARGET my_app POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E echo "Regenerating integrity hash..."
+    COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/scripts/generate_hash.cmake
+    COMMENT "Update EXPECTED_HASH after binary rebuild"
+)
+```
+
+`generate_hash.cmake` can reuse the same logic as the earlier `add_custom_command`, ensuring that any **re‑link** automatically updates the constant.
+
+### 7. Testing & CI <a name="testing--ci"></a>
+
+1. **Unit test**: Build a binary, compute its hash via the same script, then run the binary with `DISABLE_INTEGRITY_CHECK=OFF`. Expect success.
+2. **Tamper test**: Modify a byte of the binary (e.g., `dd if=/dev/zero of=app.bin bs=1 seek=100 count=1 conv=notrunc`) and confirm that the program aborts with the proper error message.
+3. **CI pipeline** (GitHub Actions, GitLab CI):
+   - Build with integrity enabled.
+   - Run the *tamper* test as a separate job.
+   - Store the generated `hash.inc` as an artifact for audit.
+
+```yaml
+# .github/workflows/integrity.yml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OpenSSL dev
+        run: sudo apt-get install -y libssl-dev
+      - name: Build
+        run: cmake -B build -DENABLE_INTEGRITY_CHECK=ON && cmake --build build
+      - name: Run normal
