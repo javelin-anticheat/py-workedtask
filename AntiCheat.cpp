@@ -114,6 +114,7 @@ static bool checkSelfIntegrity(uint32_t expectedCrc) {
 }
 
 // --- Entry helper (embed a baseline CRC once you ship a build) ---
+// Example MSVC: cl /EHsc /DJAVELIN_EXPECTED_CRC32=0x12345678 AntiCheat.cpp
 #ifndef JAVELIN_EXPECTED_CRC32
 #define JAVELIN_EXPECTED_CRC32 0u  // Set this at build time (e.g., /DJAVELIN_EXPECTED_CRC32=0x12345678)
 #endif
@@ -134,7 +135,7 @@ int main() {
     if (JAVELIN_EXPECTED_CRC32 != 0u) {
         if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
             std::cerr << kTag << "Integrity check failed (CRC mismatch). Exiting.\n";
-            return 0xCRC; // custom code (note: non-standard, may be truncated)
+            return 0xC7C; // integrity check failure
         }
     }
 
