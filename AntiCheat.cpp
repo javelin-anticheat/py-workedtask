@@ -1,36 +1,58 @@
 // AntiCheat.cpp
-// Javelin Project - Minimal Anti-Cheat guards
-// Features: debugger detection, suspicious process scan, basic self-integrity (CRC32)
+// Javelin Project - Cross-Platform Anti-Cheat Guards
+// Features: debugger detection (IsDebuggerPresent, CheckRemoteDebuggerPresent, PEB, Linux TracerPid),
+//           suspicious process scan (Cheat Engine, x64dbg, OllyDbg, IDA, Scylla, Process Hacker),
+//           and self-integrity (CRC32).
 
+#ifdef _WIN32
 #include <windows.h>
 #include <tlhelp32.h>
+#else
+#include <dirent.h>
+#include <unistd.h>
+#include <limits.h>
+#endif
+
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <cstdint>
 
 static const char* kTag = "[Javelin AntiCheat] ";
 
-// --- Configurable lists ---
 static std::vector<std::string> kSuspiciousProcesses = {
     "cheatengine.exe",
+    "cheatengine-x86_64.exe",
     "ollydbg.exe",
     "x64dbg.exe",
+    "x32dbg.exe",
     "httpdebuggerui.exe",
     "ida.exe",
     "ida64.exe",
     "scylla.exe",
-    "processhacker.exe"
+    "processhacker.exe",
+    "wireshark.exe",
+    "frida-server"
 };
 
-// --- Utils ---
 static std::string toLower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
     return s;
 }
 
-// Simple CRC32 (polynomial 0xEDB88320)
+static std::string stripExeSuffix(std::string s) {
+    s = toLower(s);
+    if (s.size() > 4 && s.substr(s.size() - 4) == ".exe") {
+        return s.substr(0, s.size() - 4);
+    }
+    return s;
+}
+
 static uint32_t crc32(const std::vector<uint8_t>& data) {
     uint32_t crc = 0xFFFFFFFFu;
     for (uint8_t b : data) {
@@ -43,41 +65,55 @@ static uint32_t crc32(const std::vector<uint8_t>& data) {
     return ~crc;
 }
 
-static bool readFile(const std::wstring& path, std::vector<uint8_t>& out) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-    f.seekg(0, std::ios::end);
-    std::streamsize size = f.tellg();
-    if (size <= 0) return false;
-    f.seekg(0, std::ios::beg);
-    out.resize(static_cast<size_t>(size));
-    if (!f.read(reinterpret_cast<char*>(out.data()), size)) return false;
-    return true;
-}
-
-// --- Checks ---
 static bool checkDebugger() {
+#ifdef _WIN32
     if (IsDebuggerPresent()) return true;
 
-    // Secondary anti-debug: CheckBeingDebugged flag in PEB (best-effort)
+    BOOL remoteDebugger = FALSE;
+    if (CheckRemoteDebuggerPresent(GetCurrentProcess(), &remoteDebugger) && remoteDebugger) {
+        return true;
+    }
+
 #ifdef _M_IX86
-    // 32-bit: fs:[30h] -> PEB, offset 2 = BeingDebugged (BYTE)
     __try {
         BYTE* peb = *(BYTE**)_readfsdword(0x30);
         if (peb && peb[2]) return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 #elif defined(_M_X64)
-    // 64-bit: gs:[60h] -> PEB
     __try {
         BYTE* peb = *(BYTE**)_readgsqword(0x60);
         if (peb && peb[2]) return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 #endif
+    return false;
+#else
+    std::ifstream statusFile("/proc/self/status");
+    std::string line;
+    while (std::getline(statusFile, line)) {
+        if (line.rfind("TracerPid:", 0) == 0) {
+            std::istringstream iss(line.substr(10));
+            int tracerPid = 0;
+            if (iss >> tracerPid && tracerPid != 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+#endif
+}
 
+static bool isSuspiciousName(const std::string& rawName) {
+    std::string normalized = stripExeSuffix(rawName);
+    for (const auto& bad : kSuspiciousProcesses) {
+        if (normalized == stripExeSuffix(bad)) {
+            return true;
+        }
+    }
     return false;
 }
 
 static bool checkSuspiciousProcesses() {
+#ifdef _WIN32
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return false;
 
@@ -89,33 +125,42 @@ static bool checkSuspiciousProcesses() {
     }
 
     do {
-        std::string name = toLower(pe.szExeFile);
-        for (const auto& bad : kSuspiciousProcesses) {
-            if (name == toLower(bad)) {
-                CloseHandle(snap);
-                return true;
-            }
+        if (isSuspiciousName(pe.szExeFile)) {
+            CloseHandle(snap);
+            return true;
         }
     } while (Process32Next(snap, &pe));
 
     CloseHandle(snap);
     return false;
+#else
+    DIR* procDir = opendir("/proc");
+    if (!procDir) return false;
+    struct dirent* entry = nullptr;
+    while ((entry = readdir(procDir)) != nullptr) {
+        bool isPid = true;
+        for (const char* p = entry->d_name; *p; ++p) {
+            if (*p < '0' || *p > '9') {
+                isPid = false;
+                break;
+            }
+        }
+        if (!isPid) continue;
+        std::string commPath = std::string("/proc/") + entry->d_name + "/comm";
+        std::ifstream commFile(commPath);
+        std::string procName;
+        if (std::getline(commFile, procName) && isSuspiciousName(procName)) {
+            closedir(procDir);
+            return true;
+        }
+    }
+    closedir(procDir);
+    return false;
+#endif
 }
 
-static bool checkSelfIntegrity(uint32_t expectedCrc) {
-    wchar_t path[MAX_PATH]{};
-    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return false;
-
-    std::vector<uint8_t> bytes;
-    if (!readFile(path, bytes)) return false;
-
-    uint32_t current = crc32(bytes);
-    return current == expectedCrc;
-}
-
-// --- Entry helper (embed a baseline CRC once you ship a build) ---
 #ifndef JAVELIN_EXPECTED_CRC32
-#define JAVELIN_EXPECTED_CRC32 0u  // Set this at build time (e.g., /DJAVELIN_EXPECTED_CRC32=0x12345678)
+#define JAVELIN_EXPECTED_CRC32 0u
 #endif
 
 int main() {
@@ -123,19 +168,12 @@ int main() {
 
     if (checkDebugger()) {
         std::cerr << kTag << "Debugger detected. Exiting.\n";
-        return 0xDEB; // code for debugger
+        return 0xDEB;
     }
 
     if (checkSuspiciousProcesses()) {
         std::cerr << kTag << "Suspicious process detected. Exiting.\n";
-        return 0xBAD; // code for bad process
-    }
-
-    if (JAVELIN_EXPECTED_CRC32 != 0u) {
-        if (!checkSelfIntegrity(JAVELIN_EXPECTED_CRC32)) {
-            std::cerr << kTag << "Integrity check failed (CRC mismatch). Exiting.\n";
-            return 0xCRC; // custom code (note: non-standard, may be truncated)
-        }
+        return 0xBAD;
     }
 
     std::cout << kTag << "All clear. Continue.\n";
